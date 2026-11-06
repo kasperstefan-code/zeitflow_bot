@@ -37,20 +37,30 @@ Layout nach `docs/vorlagen/SMF_2026_KW13.xlsx` mit diesen Änderungen:
 
 ### Übersetzung
 
-Tätigkeiten werden einmal beim Speichern über die Claude API ins Deutsche übersetzt (ein zentraler
-`ANTHROPIC_API_KEY`). Fällt die API aus, wird der Eintrag trotzdem gespeichert; die Übersetzung wird vor
-jedem Export/Versand automatisch nachgeholt. Bei einem Trupp wird der Text nur einmal übersetzt.
-Ohne API-Schlüssel läuft der Bot weiter, fremdsprachige Tätigkeiten bleiben dann markiert.
+Tätigkeiten werden direkt nach dem Speichern im Hintergrund über die Claude API ins Deutsche übersetzt
+(ein zentraler `ANTHROPIC_API_KEY`); der Monteur bekommt die Übersetzung als kurze Folgenachricht. Fällt die
+API aus, ist der Eintrag trotzdem gespeichert; die Übersetzung wird vor jedem Export/Versand automatisch
+nachgeholt. Bei einem Trupp wird der Text nur einmal übersetzt. Ohne API-Schlüssel läuft der Bot weiter,
+fremdsprachige Tätigkeiten bleiben dann markiert.
 
 ### Versand
 
 - Pro Kunde eine E-Mail mit Excel-Anhang an `ZEITFLOW_REPORT_EMAIL`
-- Jede Woche wird pro Kunde nur einmal erfolgreich versendet (Protokoll in `report_runs`); fehlgeschlagene
-  Versände werden beim nächsten Lauf bzw. per `/versenden` wiederholt
+- Jede Woche geht pro Kunde einmal raus. Ändert sich eine bereits versendete Woche danach (Nachtrag nach
+  Sonntag 19:00, Korrektur, Löschung, Anfahrten nachgetragen), sendet der nächste Sonntagslauf automatisch
+  eine Fassung mit „(korrigiert)“ im Betreff – nur für die betroffenen Kunden. Sofort geht das über
+  `/versenden` → „Neue und geänderte“.
+- Fehlgeschlagene Versände werden nach 30 Minuten automatisch wiederholt (bis zu 3 Versuche), danach beim
+  nächsten Sonntagslauf oder per `/versenden`
 - Die Admins erhalten nach jedem Lauf eine Zusammenfassung in Telegram; was nicht per E-Mail rausging, kommt
-  als Datei direkt in den Chat
-- Einträge, die nach Sonntag 19:00 für die abgelaufene Woche nachgetragen werden, per `/versenden`
-  („Alle erneut senden“) nachliefern
+  als Datei direkt in den Chat. Bricht der Lauf ab, gibt es eine Warnung.
+
+### Rechte und Zeitfenster
+
+- Monteure korrigieren eigene Einträge der letzten 14 Tage; Vorarbeiter zusätzlich die von Mitarbeitern und
+  selbst erfasste; das Büro alle Einträge der letzten 62 Tage
+- Neue Nutzer sind gesperrt, bis ein Admin sie freischaltet. Admins werden ausschließlich über
+  `ZEITFLOW_ADMIN_IDS` oder durch einen bestehenden Admin (`/mitarbeiter`) bestimmt.
 
 ## Konfiguration
 
@@ -66,7 +76,8 @@ ANTHROPIC_API_KEY, ZEITFLOW_REPORT_EMAIL, ZEITFLOW_SMTP_HOST/USER/PASSWORD/FROM
 1. Repository in Railway verbinden (**New Project → Deploy from GitHub Repo**), Build per `Dockerfile`.
 2. **Volume** mit Mount-Pfad `/data` anlegen (dort liegt die SQLite-Datenbank).
 3. Variablen aus `env.example` unter **Variables** setzen.
-4. Deployen. Im Log erscheint `ZeitFlow gestartet …`.
+4. Deployen. Im Log erscheint `ZeitFlow gestartet …`. Fehlt `ZEITFLOW_ADMIN_IDS` und gibt es noch keinen
+   Admin, bricht der Start bewusst ab (sonst könnte ein Fremder Admin werden).
 5. In Telegram `/start` senden (als Admin-ID aus `ZEITFLOW_ADMIN_IDS`), dann Kunden und Projekte anlegen.
 
 Render o. ä.: Start-Befehl `python -m zeitflow`, persistente Disk unter `/data`.
@@ -75,7 +86,8 @@ Render o. ä.: Start-Befehl `python -m zeitflow`, persistente Disk unter `/data`
 
 Beim ersten Start migriert der Bot die bestehende Datenbank automatisch: Benutzer, Rollen, Projekte und
 Arbeitseinträge werden übernommen, Kunden aus dem Projektfeld „Kunde“ angelegt. Urlaub/Krank-Einträge werden
-nicht übernommen. Die alten Tabellen bleiben als `legacy_*` erhalten. Vorher trotzdem ein Backup der
+nicht übernommen. Nutzer mit Lettisch als Sprache werden auf Deutsch umgestellt (Lettisch wird nicht mehr
+angeboten). Die alten Tabellen bleiben als `legacy_*` erhalten. Vorher trotzdem ein Backup der
 Datei `/data/zeitflow.db` ziehen.
 
 ## Entwicklung
