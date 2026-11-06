@@ -26,10 +26,17 @@ from zeitflow.bot.common import (
 from zeitflow.bot.entry import MAX_ACTIVITY_LEN
 from zeitflow.i18n import t
 from zeitflow.services import OverlapError, PermissionDenied, ValidationError
-from zeitflow.timeutil import parse_date, parse_time
+from zeitflow.timeutil import parse_break, parse_date, parse_time
 
 PICK, FIELD, VALUE, PROJECT, DELETE = range(5)
 TEXT_FIELDS = ("date", "start", "end", "break", "activity")
+FIELD_PROMPTS = {
+    "date": "pick_date",
+    "start": "ask_start",
+    "end": "ask_end",
+    "break": "ask_break",
+    "activity": "ask_activity",
+}
 KEY = "corr"
 
 
@@ -48,12 +55,36 @@ async def cmd_korrektur(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user is None:
         return ConversationHandler.END
     ctx.user_data[KEY] = {}
-    entries = deps(ctx).service.editable_entries(user)
+    service = deps(ctx).service
+    if user.can_enter_for_others:
+        # Erst den Mitarbeiter wählen – sonst wären bei großen Teams ältere Einträge nicht erreichbar.
+        counts: dict[int, tuple[str, int]] = {}
+        for e in service.editable_entries(user, limit=None):
+            name, n = counts.get(e.user_id, (e.user_name, 0))
+            counts[e.user_id] = (name, n + 1)
+        if not counts:
+            await update.message.reply_text(t(user.lang, "no_entries"))
+            return ConversationHandler.END
+        rows = [[(f"{name} ({n})", f"ku:{uid}")] for uid, (name, n) in sorted(counts.items(), key=lambda x: x[1][0])]
+        await update.message.reply_text(t(user.lang, "pick_worker"), reply_markup=keyboard(rows))
+        return PICK
+    return await _show_entries(update, user, service.editable_entries(user))
+
+
+async def on_pick_worker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = await current_user(update, ctx)
+    if user is None:
+        return ConversationHandler.END
+    worker_id = int(update.callback_query.data.split(":")[1])
+    return await _show_entries(update, user, deps(ctx).service.editable_entries(user, user_id=worker_id))
+
+
+async def _show_entries(update: Update, user, entries):
     if not entries:
-        await update.message.reply_text(t(user.lang, "no_entries"))
+        await reply(update, t(user.lang, "no_entries"))
         return ConversationHandler.END
     rows = [[(entry_label(e, with_user=user.can_enter_for_others), f"k:{e.id}")] for e in entries]
-    await update.message.reply_text(t(user.lang, "corr_pick"), reply_markup=keyboard(rows))
+    await reply(update, t(user.lang, "corr_pick"), keyboard(rows))
     return PICK
 
 
@@ -100,7 +131,7 @@ async def on_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if field not in TEXT_FIELDS:
         return await _finish(update, ctx, t(user.lang, "error"))
     _state(ctx)["field"] = field
-    await reply(update, t(user.lang, "corr_value"))
+    await reply(update, t(user.lang, FIELD_PROMPTS[field]))
     return VALUE
 
 
@@ -139,10 +170,11 @@ async def on_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 return VALUE
             service.change_times(entry_id, user, **{f"{field}_time": value})
         else:
-            if not raw.isdigit():
-                await update.message.reply_text(t(user.lang, "bad_break"))
+            minutes = parse_break(raw)
+            if minutes is None:
+                await update.message.reply_text(t(user.lang, "bad_break_format"))
                 return VALUE
-            service.change_times(entry_id, user, break_minutes=int(raw))
+            service.change_times(entry_id, user, break_minutes=minutes)
     except OverlapError as exc:
         return await _finish(update, ctx, t(user.lang, "overlap", list=overlap_lines(exc.overlaps)))
     except PermissionDenied:
@@ -192,7 +224,10 @@ def handlers():
             "korrektur",
             [CommandHandler("korrektur", cmd_korrektur)],
             {
-                PICK: [CallbackQueryHandler(on_pick, pattern=r"^k:\d+$")],
+                PICK: [
+                    CallbackQueryHandler(on_pick, pattern=r"^k:\d+$"),
+                    CallbackQueryHandler(on_pick_worker, pattern=r"^ku:\d+$"),
+                ],
                 FIELD: [
                     CallbackQueryHandler(on_field, pattern=r"^kf:\d+:(date|project|start|end|break|activity|delete)$")
                 ],

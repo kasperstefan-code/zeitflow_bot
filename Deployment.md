@@ -25,6 +25,15 @@ zentrale Abrechnungsadresse.
 Sprachen der Monteur-Oberfläche: Deutsch, Russisch, Ukrainisch, Polnisch, Litauisch.
 Büro-Befehle sind deutsch.
 
+### Erfassung
+
+- Nachtschichten: Ende vor Beginn (z. B. 20:00–06:00) wird als Schicht bis zum Folgetag gebucht, am Starttag
+- Pause als Minuten (30), `1:00`, `60 min` oder Stunden mit Komma (`0,5`)
+- Überschneidet sich bei einer Trupp-Erfassung ein Monteur, bleibt der Entwurf erhalten: „Ohne … speichern“
+  oder Zeiten ändern
+- Abgelaufene Sitzungen (30 Min. bei `/zeit`, 15 Min. sonst) melden sich beim nächsten Tippen, statt Eingaben
+  stillschweigend zu verwerfen
+
 ### Stundennachweis
 
 Layout nach `docs/vorlagen/SMF_2026_KW13.xlsx` mit diesen Änderungen:
@@ -51,6 +60,10 @@ fremdsprachige Tätigkeiten bleiben dann markiert.
   Sonntag 19:00, Korrektur, Löschung, Anfahrten nachgetragen), sendet der nächste Sonntagslauf automatisch
   eine Fassung mit „(korrigiert)“ im Betreff – nur für die betroffenen Kunden. Sofort geht das über
   `/versenden` → „Neue und geänderte“.
+- `/versenden` → „Alle erneut senden“ verschickt unveränderte Wochen mit „(erneut gesendet)“, nicht „(korrigiert)“
+- Ändert das Büro Bezeichnung oder Kostenstelle eines Projekts (`/projekt`), werden die betroffenen Wochen der
+  letzten 70 Tage als Korrektur nachversendet; der Bot nennt die Anzahl
+- Ohne `ZEITFLOW_REPORT_EMAIL` gehen nur die Nachweise der laufenden Woche per Telegram an die Admins
 - Fehlgeschlagene Versände werden nach 30 Minuten automatisch wiederholt (bis zu 3 Versuche), danach beim
   nächsten Sonntagslauf oder per `/versenden`
 - Die Admins erhalten nach jedem Lauf eine Zusammenfassung in Telegram; was nicht per E-Mail rausging, kommt

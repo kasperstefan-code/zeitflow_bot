@@ -6,21 +6,21 @@ from datetime import timedelta
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import BaseRequest
 
 from zeitflow.bot import admin, correction, entry, registration, views
-from zeitflow.bot.common import Deps, bind_dialogs, cancel
+from zeitflow.bot.common import TEXT, Deps, bind_dialogs, cancel, ignore_edits, stale_button, stray_text
 from zeitflow.bot.menu import set_default_commands, set_user_commands
 from zeitflow.config import ConfigError, Settings, load_settings
 from zeitflow.db import connect, migrate
 from zeitflow.i18n import DEFAULT_LANG, t
 from zeitflow.mailer import Mailer, SmtpMailer
 from zeitflow.models import Role, UserStatus
-from zeitflow.reporting import WeeklyReporter, WeeklyRunResult
+from zeitflow.reporting import TRANSLATION_BUDGET_SECONDS, WeeklyReporter, WeeklyRunResult
 from zeitflow.repository import Repository
 from zeitflow.services import TimesheetService
-from zeitflow.timeutil import today
+from zeitflow.timeutil import iso_week_range, today
 from zeitflow.translation import Translator, build_translator
 
 LOG = logging.getLogger("zeitflow")
@@ -81,9 +81,13 @@ async def weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         weeks = sorted({*map(tuple, data.get("weeks", [])), *d.reporter.pending_weeks()})
         LOG.info("Wochenversand (Versuch %s) für KW %s", attempt + 1, ", ".join(f"{w}/{y}" for y, w in weeks))
         current = tuple(d.today().isocalendar())[:2]
+        weeks.sort(key=lambda w: (w != current, w))
+        # Ein gemeinsames Übersetzungsbudget für den ganzen Lauf statt eines pro Woche.
+        oldest = min(iso_week_range(y, w)[0] for y, w in weeks)
+        await d.service.translate_pending(oldest, d.today(), max_seconds=TRANSLATION_BUDGET_SECONDS)
         results: list[WeeklyRunResult] = []
         for year, week in weeks:
-            results.append(await d.reporter.run(year, week))
+            results.append(await d.reporter.run(year, week, translate=False))
         admin_chats = [a.telegram_id for a in d.repo.list_admins()]
         for result in results:
             LOG.info(result.summary())
@@ -139,10 +143,14 @@ def build_application(settings: Settings, deps: Deps | None = None, request: Bas
         builder = builder.request(request).get_updates_request(request)
     app = builder.build()
     app.bot_data["deps"] = deps or build_deps(settings)
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED, ignore_edits), group=-1)
     for module in (registration, entry, views, correction, admin):
         for handler in module.handlers():
             app.add_handler(handler)
-    app.add_handler(CommandHandler("cancel", cancel))  # /cancel ohne offenen Dialog
+    # Auffangnetz, nur wenn nichts davor gegriffen hat (gleiche Gruppe, daher nachrangig):
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(stale_button))
+    app.add_handler(MessageHandler(TEXT, stray_text))
     bind_dialogs(app)
     app.add_error_handler(on_error)
     report_time = settings.report_time.replace(tzinfo=settings.timezone)

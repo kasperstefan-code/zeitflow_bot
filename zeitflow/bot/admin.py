@@ -25,7 +25,7 @@ from zeitflow.export import render_report
 from zeitflow.i18n import t
 from zeitflow.mailer import MailError
 from zeitflow.models import Role, UserStatus
-from zeitflow.reporting import WeeklyRunResult
+from zeitflow.reporting import LOOKBACK_DAYS, WeeklyRunResult
 from zeitflow.services import build_week_report
 from zeitflow.timeutil import iso_week_range, parse_week
 
@@ -36,15 +36,15 @@ EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 EXPIRED = "Sitzung abgelaufen, bitte den Befehl neu starten."
 
 
-def _week_keyboard(ctx, prefix: str):
+def _week_keyboard(ctx, prefix: str, lang: str = "de"):
     today = deps(ctx).today()
     cur = today.isocalendar()
     prev = (today - timedelta(days=7)).isocalendar()
     return keyboard(
         [
             [
-                (f"KW {cur.week:02d} (aktuell)", f"{prefix}:{cur.year}:{cur.week}"),
-                (f"KW {prev.week:02d} (Vorwoche)", f"{prefix}:{prev.year}:{prev.week}"),
+                (t(lang, "week_current", week=f"{cur.week:02d}"), f"{prefix}:{cur.year}:{cur.week}"),
+                (t(lang, "week_prev", week=f"{prev.week:02d}"), f"{prefix}:{prev.year}:{prev.week}"),
             ]
         ]
     )
@@ -266,8 +266,11 @@ async def on_ep_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if "id" not in state or "field" not in state:
         await update.message.reply_text(EXPIRED)
         return ConversationHandler.END
-    deps(ctx).repo.update_project(state["id"], **{state["field"]: update.message.text.strip()})
-    await update.message.reply_text("✅ Gespeichert.")
+    d = deps(ctx)
+    since = d.today() - timedelta(days=LOOKBACK_DAYS)
+    weeks = d.repo.update_project(state["id"], touch_since=since, **{state["field"]: update.message.text.strip()})
+    note = f"\n{weeks} Woche(n) werden beim nächsten Versand korrigiert (oder sofort per /versenden)." if weeks else ""
+    await update.message.reply_text("✅ Gespeichert." + note)
     return ConversationHandler.END
 
 
@@ -283,20 +286,20 @@ async def cmd_anfahrt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return TR_WEEK
 
 
-async def _ask_week_customer(update: Update, ctx, prefix: str, next_state: int):
+async def _ask_week_customer(update: Update, ctx, prefix: str, next_state: int, lang: str = "de"):
     """Fragt den Kunden; die KW wandert in die Callback-Daten (prefix:Jahr:KW:Kunde)."""
     week = _week_from(update, ctx)
     if week is None:
-        await reply(update, "KW nicht erkannt. Beispiel: 13/2026")
+        await reply(update, t(lang, "bad_week"))
         return None
     year, iso_week = week
     monday, sunday = iso_week_range(year, iso_week)
     customers = deps(ctx).repo.customers_with_entries(monday, sunday)
     if not customers:
-        await reply(update, f"Keine Einträge in KW {iso_week:02d}/{year}.")
+        await reply(update, t(lang, "no_entries_week", week=f"{iso_week:02d}", year=year))
         return ConversationHandler.END
     rows = [[(c.name, f"{prefix}:{year}:{iso_week}:{c.id}")] for c in customers]
-    await reply(update, f"KW {iso_week:02d}/{year} – welcher Kunde?", keyboard(rows))
+    await reply(update, f"{iso_week:02d}/{year} – {t(lang, 'pick_customer')}", keyboard(rows))
     return next_state
 
 
@@ -348,16 +351,18 @@ EX_WEEK, EX_CUSTOMER = range(40, 42)
 
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await current_user(update, ctx, min_role=Role.FOREMAN) is None:
+    user = await current_user(update, ctx, min_role=Role.FOREMAN)
+    if user is None:
         return ConversationHandler.END
-    await update.message.reply_text("Welche KW? (oder eingeben, z. B. 13/2026)", reply_markup=_week_keyboard(ctx, "xw"))
+    await update.message.reply_text(t(user.lang, "export_week"), reply_markup=_week_keyboard(ctx, "xw", user.lang))
     return EX_WEEK
 
 
 async def on_ex_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await current_user(update, ctx, min_role=Role.FOREMAN) is None:
+    user = await current_user(update, ctx, min_role=Role.FOREMAN)
+    if user is None:
         return ConversationHandler.END
-    state = await _ask_week_customer(update, ctx, "xc", EX_CUSTOMER)
+    state = await _ask_week_customer(update, ctx, "xc", EX_CUSTOMER, user.lang)
     return EX_WEEK if state is None else state
 
 
@@ -367,15 +372,15 @@ async def on_ex_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     year, week, customer_id = _callback_ints(update)
     if deps(ctx).repo.get_customer(customer_id) is None:
-        await reply(update, "Kunde nicht gefunden.")
+        await reply(update, t(user.lang, "error"))
         return ConversationHandler.END
-    await reply(update, "⏳ Erstelle Stundennachweis …")
+    await reply(update, t(user.lang, "export_creating"))
     chat_id = update.effective_chat.id
-    background(ctx, _send_export(ctx, chat_id, customer_id, year, week), chat_id, user.lang)
+    background(ctx, _send_export(ctx, chat_id, customer_id, year, week, user.lang), chat_id, user.lang)
     return ConversationHandler.END
 
 
-async def _send_export(ctx, chat_id: int, customer_id: int, year: int, week: int) -> None:
+async def _send_export(ctx, chat_id: int, customer_id: int, year: int, week: int, lang: str = "de") -> None:
     d = deps(ctx)
     monday, sunday = iso_week_range(year, week)
     await d.service.translate_pending(monday, sunday, customer_id=customer_id)
@@ -383,7 +388,7 @@ async def _send_export(ctx, chat_id: int, customer_id: int, year: int, week: int
     file = render_report(report)
     caption = f"KW {week:02d}/{year} · {report.customer_name}"
     if report.untranslated:
-        caption += f"\n⚠️ {report.untranslated} Tätigkeit(en) noch nicht übersetzt"
+        caption += "\n" + t(lang, "export_untranslated", count=report.untranslated)
     await ctx.bot.send_document(chat_id, document=io.BytesIO(file.content), filename=file.filename, caption=caption)
 
 

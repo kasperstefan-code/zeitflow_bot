@@ -57,18 +57,46 @@ def to_minutes(hhmm: str) -> int:
     return int(hh) * 60 + int(mm)
 
 
+def gross_minutes(start: str, end: str) -> int:
+    """Brutto-Dauer; Ende vor Beginn bedeutet Nachtschicht bis zum Folgetag (z. B. 20:00–06:00 = 600)."""
+    gross = (to_minutes(end) - to_minutes(start)) % (24 * 60)
+    if gross == 0:
+        raise ValueError("Ende muss sich vom Beginn unterscheiden")
+    return gross
+
+
+def span(day: date, start: str, end: str) -> tuple[int, int]:
+    """Absolute Minuten [von, bis) – vergleichbar über Tagesgrenzen hinweg (Nachtschichten)."""
+    begin = day.toordinal() * 24 * 60 + to_minutes(start)
+    return begin, begin + gross_minutes(start, end)
+
+
+def parse_break(raw: str) -> int | None:
+    """Pause in Minuten: "30", "60 min", "1:00", "1h", "0,5" (Stunden, wenn mit Komma/Punkt)."""
+    s = (raw or "").strip().lower().replace("minuten", "").replace("min", "").replace("мин", "").replace("хв", "")
+    s = s.strip()
+    m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", s)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.fullmatch(r"(\d+)\s*h", s)
+    if m:
+        return int(m.group(1)) * 60
+    m = re.fullmatch(r"(\d+)[,.](\d+)", s)
+    if m:
+        return round(float(f"{m.group(1)}.{m.group(2)}") * 60)
+    return int(s) if s.isdigit() else None
+
+
 def work_minutes(start: str, end: str, break_minutes: int) -> int:
-    """Netto-Arbeitszeit. Wirft ValueError bei Ende <= Beginn oder Pause >= Brutto."""
-    gross = to_minutes(end) - to_minutes(start)
-    if gross <= 0:
-        raise ValueError("Ende muss nach Beginn liegen")
+    """Netto-Arbeitszeit (auch über Mitternacht). Wirft ValueError bei Ende == Beginn oder Pause >= Brutto."""
+    gross = gross_minutes(start, end)
     if break_minutes < 0 or break_minutes >= gross:
         raise ValueError("Pause ist länger als die Arbeitszeit")
     return gross - break_minutes
 
 
-def intervals_overlap(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
-    return to_minutes(a_start) < to_minutes(b_end) and to_minutes(b_start) < to_minutes(a_end)
+def spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
 
 
 def iso_week_range(year: int, week: int) -> tuple[date, date]:

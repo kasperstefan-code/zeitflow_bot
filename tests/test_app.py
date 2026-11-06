@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -204,3 +204,17 @@ def test_main_exits_cleanly_without_admins(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         app_module.main()
     assert exc.value.code == 2
+
+
+async def test_telegram_only_mode_does_not_redeliver_old_weeks(tmp_path):
+    deps = build_deps(settings_for(tmp_path), FakeTranslator(), FakeMailer())
+    admin = deps.repo.create_user(1, "Anna Büro", "de", Role.ADMIN, UserStatus.ACTIVE)
+    project = deps.repo.create_project(deps.repo.create_customer("Kunde A").id, "Projekt", "1")
+    files_per_sunday = []
+    for sunday in (date(2026, 3, 29), date(2026, 4, 5), date(2026, 4, 12)):
+        deps.today = deps.service.today = (lambda d: lambda: d)(sunday)
+        deps.service.record(draft([admin.id], project.id, day=sunday - timedelta(days=3)), admin)
+        ctx = job_ctx(deps)
+        await weekly_report_job(ctx)
+        files_per_sunday.append(len(ctx.bot.documents))
+    assert files_per_sunday == [1, 1, 1]

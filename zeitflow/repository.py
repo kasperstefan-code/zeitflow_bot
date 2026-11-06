@@ -165,13 +165,28 @@ class Repository:
         ).fetchall()
         return [_project(r) for r in rows]
 
-    def update_project(self, project_id: int, **fields) -> None:
+    def update_project(self, project_id: int, touch_since: date | None = None, **fields) -> int:
+        """Ändert ein Projekt. Mit touch_since werden alle KWs ab diesem Tag, in denen das Projekt vorkommt, als
+        geändert markiert (Name/Kostenstelle stehen im Stundennachweis) – gibt deren Anzahl zurück."""
         allowed = {"name", "cost_center", "active"}
         if not fields or set(fields) - allowed:
             raise ValueError(f"Unzulässige Felder: {set(fields) - allowed}")
         cols = ", ".join(f"{k}=?" for k in fields)
+        weeks: set[tuple[int, int, int]] = set()
         with transaction(self.conn):
             self.conn.execute(f"UPDATE projects SET {cols} WHERE id=?", (*fields.values(), project_id))
+            if touch_since is not None:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT p.customer_id, e.work_date FROM entries e JOIN projects p ON p.id=e.project_id "
+                    "WHERE e.project_id=? AND e.work_date>=?",
+                    (project_id, touch_since.isoformat()),
+                ).fetchall()
+                for r in rows:
+                    iso = date.fromisoformat(r["work_date"]).isocalendar()
+                    weeks.add((r["customer_id"], iso.year, iso.week))
+                for customer_id, year, week in weeks:
+                    self._touch(customer_id, year, week)
+        return len(weeks)
 
     # --- Einträge -----------------------------------------------------------------
 

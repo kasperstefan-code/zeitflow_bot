@@ -167,3 +167,45 @@ async def test_testmail_without_entries_sends_demo(repo, world):
     reporter = WeeklyReporter(repo, make_service(repo, FakeTranslator()), mailer, "a@example.org")
     assert await reporter.send_test("stefan@example.org") == "Beispielkunde (Test)"
     assert mailer.sent[0]["attachments"][0].filename.startswith("Stundennachweis_Beispielkunde")
+
+
+async def test_forced_resend_of_unchanged_week_is_not_called_a_correction(repo, world):
+    mailer = FakeMailer()
+    reporter = WeeklyReporter(repo, seed(repo, world), mailer, "a@example.org")
+    await reporter.run(2026, 13)
+    await reporter.run(2026, 13, force=True)
+    assert mailer.sent[-1]["subject"].endswith("(erneut gesendet)")
+    assert "Unveränderte Kopie" in mailer.sent[-1]["body"]
+    assert "korrigiert" not in mailer.sent[-1]["body"]
+
+
+async def test_project_change_marks_affected_weeks(repo, world):
+    reporter = WeeklyReporter(repo, seed(repo, world), FakeMailer(), "a@example.org")
+    await reporter.run(2026, 13)
+    assert repo.weeks_needing_resend() == []
+    weeks = repo.update_project(world["p1"].id, touch_since=date(2026, 1, 1), cost_center="99999")
+    assert weeks == 1
+    assert repo.weeks_needing_resend() == [(2026, 13)]
+    assert repo.update_project(world["p3"].id, active=0) == 0, "Deaktivieren ohne touch_since markiert nichts"
+
+
+async def test_telegram_only_mode_only_handles_current_week(repo, world):
+    service = seed(repo, world)
+    service.today = lambda: date(2026, 4, 12)
+    reporter = WeeklyReporter(repo, service, FakeMailer(), "")
+    assert reporter.pending_weeks() == [(2026, 15)]
+
+
+async def test_old_failed_weeks_outside_lookback_are_dropped(repo, world):
+    service = seed(repo, world)
+    await WeeklyReporter(repo, service, FakeMailer(fail=True), "a@example.org").run(2026, 13)
+    service.today = lambda: date(2026, 9, 1)
+    reporter = WeeklyReporter(repo, service, FakeMailer(), "a@example.org")
+    assert reporter.pending_weeks() == [tuple(date(2026, 9, 1).isocalendar())[:2]]
+
+
+async def test_current_week_is_processed_first(repo, world):
+    service = seed(repo, world)
+    await WeeklyReporter(repo, service, FakeMailer(fail=True), "a@example.org").run(2026, 13)
+    service.today = lambda: date(2026, 4, 5)
+    assert WeeklyReporter(repo, service, FakeMailer(), "a@example.org").pending_weeks() == [(2026, 14), (2026, 13)]

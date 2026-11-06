@@ -11,7 +11,7 @@ from datetime import date, timedelta
 
 from zeitflow.models import Entry, Role, User
 from zeitflow.repository import Repository
-from zeitflow.timeutil import intervals_overlap, iso_week_range, short_name, to_minutes, work_minutes
+from zeitflow.timeutil import iso_week_range, short_name, span, spans_overlap, to_minutes, work_minutes
 from zeitflow.translation import Translator
 
 UNTRANSLATED_PREFIX = "[nicht übersetzt] "
@@ -65,7 +65,7 @@ class RecordResult:
 
 
 def _net_minutes(start: str, end: str, break_minutes: int) -> int:
-    if to_minutes(end) <= to_minutes(start):
+    if to_minutes(end) == to_minutes(start):
         raise ValidationError("end_before_start")
     try:
         return work_minutes(start, end, break_minutes)
@@ -146,10 +146,15 @@ class TimesheetService:
         return result if updated else None
 
     def _overlaps(self, user_id: int, day: date, start: str, end: str, ignore_id: int | None = None) -> list[Overlap]:
+        # Vortag und Folgetag mitprüfen – Nachtschichten reichen über Mitternacht.
+        new = span(day, start, end)
+        nearby = self.repo.list_entries(
+            user_id=user_id, date_from=day - timedelta(days=1), date_to=day + timedelta(days=1)
+        )
         return [
             Overlap(e.user_name, e)
-            for e in self.repo.list_entries(user_id=user_id, date_from=day, date_to=day)
-            if e.id != ignore_id and intervals_overlap(start, end, e.start_time, e.end_time)
+            for e in nearby
+            if e.id != ignore_id and spans_overlap(new, span(e.work_date, e.start_time, e.end_time))
         ]
 
     # --- Korrektur ----------------------------------------------------------------
@@ -162,13 +167,16 @@ class TimesheetService:
             return entry.created_by == actor.id or (owner is not None and owner.role is Role.EMPLOYEE)
         return False
 
-    def editable_entries(self, actor: User, limit: int = 30) -> list[Entry]:
+    def editable_entries(self, actor: User, user_id: int | None = None, limit: int | None = 60) -> list[Entry]:
+        """Korrigierbare Einträge im Zeitfenster; Monteure sehen nur eigene, sonst optional auf user_id gefiltert."""
         days = MAX_PAST_DAYS if actor.is_admin else EDIT_WINDOW_DAYS
-        user_id = None if actor.can_enter_for_others else actor.id
+        if not actor.can_enter_for_others:
+            user_id = actor.id
         candidates = self.repo.list_entries(
             user_id=user_id, date_from=self.today() - timedelta(days=days), newest_first=True
         )
-        return [e for e in candidates if self._may_edit(actor, e)][:limit]
+        editable = [e for e in candidates if self._may_edit(actor, e)]
+        return editable[:limit] if limit else editable
 
     def editable(self, entry_id: int, actor: User) -> Entry:
         entry = self.repo.get_entry(entry_id)

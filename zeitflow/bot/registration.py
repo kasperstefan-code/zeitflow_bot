@@ -30,7 +30,7 @@ def _language_keyboard(prefix: str):
 def menu_text(user) -> str:
     text = t(user.lang, "menu")
     if user.can_enter_for_others:
-        text += "\n\n🦺 Vorarbeiter:\n/export – Stundennachweis als Excel"
+        text += "\n\n" + t(user.lang, "menu_foreman")
     if user.is_admin:
         text += (
             "\n\n👑 Büro:\n/mitarbeiter – Mitarbeiter, Rollen, Freigaben\n/kunden – Kunden & Projekte\n"

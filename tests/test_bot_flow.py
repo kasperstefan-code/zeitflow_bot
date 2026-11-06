@@ -208,7 +208,7 @@ async def test_worker_sees_no_crew_selection_and_invalid_input_is_reprompted(bot
     await bot.send(WORKER_TG, "25:00")
     assert bot.req.texts(WORKER_TG)[-1] == "Nie rozpoznano godziny. Przykład: 7:00"
     await bot.send(WORKER_TG, "8")
-    await bot.send(WORKER_TG, "7")
+    await bot.send(WORKER_TG, "8:00")
     assert bot.req.texts(WORKER_TG)[-1] == "Koniec musi być po początku."
     await bot.send(WORKER_TG, "16:30")
     await bot.press(WORKER_TG, "b:30")
@@ -514,3 +514,113 @@ async def test_testmail_command(bot):
     assert not bot.deps.repo.report_already_sent(bot.project.customer_id, *bot.deps.today().isocalendar()[:2])
     await bot.send(WORKER_TG, "/testmail stefan@example.org")
     assert bot.req.texts(WORKER_TG)[-1] == "Brak uprawnień."
+
+
+# --- Runde 3 ---------------------------------------------------------------------------------------------
+
+
+async def test_edited_command_cannot_revive_dormant_dialog(bot):
+    today = bot.deps.today()
+    bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=today), bot.worker)
+    iso, cid = today.isocalendar(), bot.project.customer_id
+    await bot.send(ADMIN_TG, "/anfahrt")
+    await bot.press(ADMIN_TG, f"tw:{iso.year}:{iso.week}")
+    await bot.press(ADMIN_TG, f"tc:{iso.year}:{iso.week}:{cid}")
+    await bot.send(ADMIN_TG, "/zeit")
+    await bot.edit(ADMIN_TG, "/anfahrt")
+    await bot.send(ADMIN_TG, "7")
+    assert bot.deps.repo.get_travel_count(cid, iso.year, iso.week) is None
+
+
+async def test_old_summary_save_button_after_new_summary(bot):
+    today = bot.deps.today()
+
+    async def fill(activity):
+        await bot.send(WORKER_TG, "/zeit")
+        await bot.press(WORKER_TG, f"d:{today.isoformat()}")
+        await bot.press(WORKER_TG, "t:07:00")
+        await bot.send(WORKER_TG, "15:00")
+        await bot.press(WORKER_TG, "b:30")
+        await bot.send(WORKER_TG, activity)
+        return next(d for _, d in bot.req.last_buttons() if d.startswith("ok:"))
+
+    old_ok = await fill("A")
+    new_ok = await fill("B")
+    assert old_ok != new_ok
+    await bot.press(WORKER_TG, old_ok)
+    assert bot.deps.repo.list_entries() == []
+
+
+async def test_buttons_and_text_without_dialog_get_feedback(bot):
+    await bot.press(WORKER_TG, "ok:99")  # z. B. nach Ablauf der Sitzung
+    alerts = [p for n, p in bot.req.calls if n == "answerCallbackQuery"]
+    assert alerts and alerts[-1].get("text") == "Sesja wygasła. Zacznij od nowa."
+    await bot.send(WORKER_TG, "hallo")
+    assert bot.req.texts(WORKER_TG)[-1] == "Brak otwartej czynności. Nowy wpis: /zeit, pomoc: /hilfe."
+
+
+async def test_overnight_shift_with_relative_end_buttons(bot):
+    today = bot.deps.today()
+    yesterday = today - timedelta(days=1)
+    await bot.send(WORKER_TG, "/zeit")
+    await bot.press(WORKER_TG, f"d:{yesterday.isoformat()}")
+    await bot.send(WORKER_TG, "20:00")
+    assert ("06:00", "t:06:00") in bot.req.last_buttons()
+    await bot.press(WORKER_TG, "t:06:00")
+    await bot.send(WORKER_TG, "1:00")  # Pause im Format der Vorlage
+    await bot.send(WORKER_TG, "Nocna zmiana")
+    await bot.press_matching(WORKER_TG, "ok:")
+    (entry,) = bot.deps.repo.list_entries()
+    assert (entry.work_date, entry.start_time, entry.end_time, entry.work_minutes) == (yesterday, "20:00", "06:00", 540)
+
+
+async def test_crew_overlap_keeps_draft_and_saves_without_clashing_worker(bot):
+    today = bot.deps.today()
+    bot.deps.service.record(
+        draft([bot.worker.id], bot.project.id, day=today, start="05:00", end="06:30", brk=0), bot.worker
+    )
+    await bot.send(FOREMAN_TG, "/zeit")
+    await bot.press(FOREMAN_TG, f"w:{bot.worker.id}")
+    await bot.press(FOREMAN_TG, "w:next")
+    await bot.press(FOREMAN_TG, f"d:{today.isoformat()}")
+    await bot.press(FOREMAN_TG, "t:06:00")
+    await bot.send(FOREMAN_TG, "16:00")
+    await bot.press(FOREMAN_TG, "b:30")
+    await bot.send(FOREMAN_TG, "Монтаж")
+    await bot.press_matching(FOREMAN_TG, "ok:")
+    assert "Ничего не сохранено." in bot.req.texts(FOREMAN_TG)[-1]
+    await bot.press_matching(FOREMAN_TG, "ov:")  # "Сохранить без: K. Kroll"
+    users = sorted(e.user_id for e in bot.deps.repo.list_entries())
+    assert users == sorted([bot.worker.id, bot.foreman.id])
+    assert len([e for e in bot.deps.repo.list_entries() if e.user_id == bot.foreman.id]) == 1
+
+
+async def test_export_speaks_the_foremans_language(bot):
+    await bot.send(FOREMAN_TG, "/export")
+    assert bot.req.texts(FOREMAN_TG)[-1] == "Какая неделя? (или введите, например 13/2026)"
+    assert bot.req.last_buttons()[0][0].startswith("Неделя ")
+
+
+async def test_foreman_correction_picks_worker_first(bot):
+    today = bot.deps.today()
+    for d in range(10):  # viele Einträge – ältere müssen erreichbar bleiben
+        bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=today - timedelta(days=d)), bot.foreman)
+    await bot.send(FOREMAN_TG, "/korrektur")
+    assert ("Kamil Kroll (10)", f"ku:{bot.worker.id}") in bot.req.last_buttons()
+    await bot.press(FOREMAN_TG, f"ku:{bot.worker.id}")
+    assert len(bot.req.last_buttons()) == 10
+
+
+async def test_blocked_worker_gets_specific_message(bot):
+    today = bot.deps.today()
+    await bot.send(FOREMAN_TG, "/zeit")
+    await bot.press(FOREMAN_TG, f"w:{bot.worker.id}")
+    await bot.press(FOREMAN_TG, "w:next")
+    await bot.press(FOREMAN_TG, f"d:{today.isoformat()}")
+    await bot.press(FOREMAN_TG, "t:06:00")
+    await bot.send(FOREMAN_TG, "16:00")
+    await bot.press(FOREMAN_TG, "b:30")
+    await bot.send(FOREMAN_TG, "Монтаж")
+    bot.deps.repo.update_user(bot.worker.id, status=UserStatus.INACTIVE)
+    await bot.press_matching(FOREMAN_TG, "ok:")
+    assert bot.req.texts(FOREMAN_TG)[-1].startswith("Один из выбранных монтажников больше не активен")

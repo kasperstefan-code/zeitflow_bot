@@ -37,12 +37,11 @@ from zeitflow.services import (
     PermissionDenied,
     ValidationError,
 )
-from zeitflow.timeutil import parse_date, parse_time, short_name, to_minutes, work_minutes
+from zeitflow.timeutil import parse_break, parse_date, parse_time, short_name, to_minutes, work_minutes
 
 (WORKERS, CUSTOMER, PROJECT, DATE, START, END, BREAK, ACTIVITY, CONFIRM, MORE) = range(10)
 
 START_TIMES = ["06:00", "06:30", "07:00", "07:30", "08:00", "08:30"]
-END_TIMES = ["15:00", "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30", "19:00"]
 BREAKS = [0, 15, 30, 45, 60]
 MAX_ACTIVITY_LEN = 500
 
@@ -207,8 +206,7 @@ async def on_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await reply(update, t(user.lang, "bad_time"))
         return START
     _draft(ctx)["start"] = value
-    options = [x for x in END_TIMES if to_minutes(x) > to_minutes(value)]
-    await reply(update, t(user.lang, "ask_end"), keyboard(chunk([(x, f"t:{x}") for x in options], 3)))
+    await reply(update, t(user.lang, "ask_end"), keyboard(chunk([(x, f"t:{x}") for x in end_options(value)], 3)))
     return END
 
 
@@ -222,7 +220,7 @@ async def on_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return END
     if "start" not in _draft(ctx):
         return await _expired(update, user)
-    if to_minutes(value) <= to_minutes(_draft(ctx)["start"]):
+    if value == _draft(ctx)["start"]:
         await reply(update, t(user.lang, "end_before_start"))
         return END
     _draft(ctx)["end"] = value
@@ -238,8 +236,11 @@ async def on_break(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     draft = _draft(ctx)
     if "end" not in draft:
         return await _expired(update, user)
+    minutes = parse_break(raw)
+    if minutes is None:
+        await reply(update, t(user.lang, "bad_break_format"))
+        return BREAK
     try:
-        minutes = int(raw)
         work_minutes(draft["start"], draft["end"], minutes)
     except ValueError:
         await reply(update, t(user.lang, "bad_break"))
@@ -276,22 +277,35 @@ async def on_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hours=fmt_hours(work_minutes(draft["start"], draft["end"], draft["break"])),
         activity=draft["activity"],
     )
-    # Nonce: ein alter Speichern-Button aus einer früheren Zusammenfassung speichert nicht den neuen Entwurf.
-    draft["nonce"] = draft.get("nonce", 0) + 1
-    nonce = draft["nonce"]
+    # Nonce zählt über alle /zeit-Durchläufe hoch: ein alter Speichern-Button trifft nie einen neuen Entwurf.
+    nonce = ctx.user_data["nonce_seq"] = ctx.user_data.get("nonce_seq", 0) + 1
+    draft["nonce"] = nonce
     markup = keyboard([[(t(user.lang, "save"), f"ok:{nonce}"), (t(user.lang, "cancel"), f"x:{nonce}")]])
     await update.message.reply_text(f"{summary}\n\n{t(user.lang, 'confirm')}", reply_markup=markup)
     return CONFIRM
+
+
+def end_options(start: str) -> list[str]:
+    """Ende-Buttons relativ zum Beginn (8–11 h) – passt auch für späte Starts und Nachtschichten."""
+    base = to_minutes(start)
+    return [f"{(base + m) // 60 % 24:02d}:{(base + m) % 60:02d}" for m in range(8 * 60, 11 * 60 + 1, 30)]
 
 
 async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = await current_user(update, ctx)
     if user is None:
         return ConversationHandler.END
-    action, nonce = update.callback_query.data.split(":")
+    action, nonce, *rest = update.callback_query.data.split(":")
     if int(nonce) != _draft(ctx).get("nonce"):
         return await _expired(update, user)
-    if action == "x":
+    if action == "ov":
+        if rest == ["times"]:
+            return await _ask_start(update, ctx, user)
+        skip = {int(x) for x in rest[0].split(",")} if rest and rest[0] else set()
+        _draft(ctx)["workers"] = [w for w in _draft(ctx)["workers"] if w not in skip]
+        if not _draft(ctx)["workers"]:
+            return await _expired(update, user)
+    elif action == "x":
         ctx.user_data.pop("draft", None)
         await reply(update, t(user.lang, "cancelled"))
         return ConversationHandler.END
@@ -313,9 +327,18 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         result = service.record(entry, user)
     except OverlapError as exc:
-        await update.callback_query.edit_message_text(t(user.lang, "overlap", list=overlap_lines(exc.overlaps)))
-        ctx.user_data.pop("draft", None)
-        return ConversationHandler.END
+        # Entwurf behalten: bei einem Trupp nur die Betroffenen weglassen oder Zeiten ändern statt alles neu.
+        clashing = sorted({o.existing.user_id for o in exc.overlaps})
+        names = ", ".join(sorted({short_name(o.user_name) for o in exc.overlaps}))
+        rows = []
+        if set(draft["workers"]) - set(clashing):
+            skip = ",".join(map(str, clashing))
+            rows.append([(t(user.lang, "save_without", names=names), f"ov:{nonce}:{skip}")])
+        rows.append([(t(user.lang, "change_times"), f"ov:{nonce}:times")])
+        rows.append([(t(user.lang, "cancel"), f"x:{nonce}")])
+        text = t(user.lang, "overlap", list=overlap_lines(exc.overlaps)) + "\n" + t(user.lang, "nothing_saved")
+        await update.callback_query.edit_message_text(text, reply_markup=keyboard(rows))
+        return CONFIRM
     except ValidationError as exc:
         await update.callback_query.edit_message_text(error_text(user.lang, exc))
         ctx.user_data.pop("draft", None)
@@ -349,7 +372,10 @@ async def on_more(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user is None:
         return ConversationHandler.END
     if update.callback_query.data == "m:y" and _draft(ctx).get("workers"):
-        return await _ask_customer(update, ctx, user)
+        repo = deps(ctx).repo
+        _draft(ctx)["workers"] = [w for w in _draft(ctx)["workers"] if (u := repo.get_user(w)) and u.is_active]
+        if _draft(ctx)["workers"]:
+            return await _ask_customer(update, ctx, user)
     ctx.user_data.pop("draft", None)
     await reply(update, t(user.lang, "done"))
     return ConversationHandler.END
@@ -370,7 +396,7 @@ def handlers():
                 END: [CallbackQueryHandler(on_end, pattern=r"^t:"), MessageHandler(text, on_end)],
                 BREAK: [CallbackQueryHandler(on_break, pattern=r"^b:\d+$"), MessageHandler(text, on_break)],
                 ACTIVITY: [MessageHandler(text, on_activity)],
-                CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^(ok|x):\d+$")],
+                CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^((ok|x):\d+|ov:\d+:(times|[\d,]+))$")],
                 MORE: [CallbackQueryHandler(on_more, pattern=r"^m:[yn]$")],
             },
             timeout=1800,

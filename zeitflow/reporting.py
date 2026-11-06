@@ -74,8 +74,15 @@ class WeeklyReporter:
         """
         today = self.service.today()
         current = tuple(today.isocalendar())[:2]
+        if not self.recipient:
+            # Ohne E-Mail-Adresse wird nichts als versendet verbucht – sonst gingen jeden Sonntag alle Altwochen
+            # erneut an die Admins.
+            return [current]
         since = today - timedelta(days=LOOKBACK_DAYS)
-        weeks = {current, *self.repo.weeks_needing_resend()}
+        weeks = {current}
+        for year, week in self.repo.weeks_needing_resend():
+            if iso_week_range(year, week)[1] >= since:
+                weeks.add((year, week))
         for customer_id, year, week in self.repo.unsent_changed_weeks():
             monday, sunday = iso_week_range(year, week)
             if (
@@ -86,12 +93,16 @@ class WeeklyReporter:
                 weeks.add((year, week))
         for e in self.repo.list_entries(date_from=since, untranslated_only=True):
             weeks.add(tuple(e.work_date.isocalendar())[:2])
-        return sorted(weeks)
+        # Laufende Woche zuerst: sie ist die wichtigste und soll nicht hinter Altwochen warten.
+        return sorted(weeks, key=lambda w: (w != current, w))
 
-    async def run(self, iso_year: int, iso_week: int, *, force: bool = False) -> WeeklyRunResult:
+    async def run(
+        self, iso_year: int, iso_week: int, *, force: bool = False, translate: bool = True
+    ) -> WeeklyRunResult:
         monday, sunday = iso_week_range(iso_year, iso_week)
         # Außerhalb der Sperre und mit Zeitlimit: eine langsame Claude API blockiert weder /versenden noch den Versand.
-        await self.service.translate_pending(monday, sunday, max_seconds=TRANSLATION_BUDGET_SECONDS)
+        if translate:
+            await self.service.translate_pending(monday, sunday, max_seconds=TRANSLATION_BUDGET_SECONDS)
         # Sonntagsjob und /versenden können gleichzeitig laufen – ohne Sperre ginge eine Woche doppelt raus.
         async with self._lock:
             return await self._run(iso_year, iso_week, force)
@@ -104,16 +115,16 @@ class WeeklyReporter:
         for customer in sorted(candidates.values(), key=lambda c: c.name):
             last_sent = self.repo.last_sent_at(customer.id, iso_year, iso_week)
             changed = self.repo.week_changed_at(customer.id, iso_year, iso_week)
-            is_correction = last_sent is not None
-            if is_correction and not force and not (changed and changed > last_sent):
+            changed_since = last_sent is not None and changed is not None and changed > last_sent
+            if last_sent is not None and not force and not changed_since:
                 result.results.append(CustomerResult(customer.name, "skipped", "bereits versendet"))
                 continue
-            result.results.append(await self._send(customer.id, customer.name, iso_year, iso_week, is_correction))
+            kind = "first" if last_sent is None else ("correction" if changed_since else "resend")
+            result.results.append(await self._send(customer.id, customer.name, iso_year, iso_week, kind))
         return result
 
-    async def _send(
-        self, customer_id: int, name: str, iso_year: int, iso_week: int, correction: bool
-    ) -> CustomerResult:
+    async def _send(self, customer_id: int, name: str, iso_year: int, iso_week: int, kind: str) -> CustomerResult:
+        """kind: "first" | "correction" (Daten geändert) | "resend" (unverändert erneut gesendet)."""
         snapshot = utc_stamp()  # Änderungen ab hier lösen den nächsten Korrekturversand aus
         file = None
         try:
@@ -121,10 +132,9 @@ class WeeklyReporter:
             file = render_report(report)
             if not self.recipient:
                 return CustomerResult(name, "failed", "ZEITFLOW_REPORT_EMAIL fehlt", file)
-            subject = f"Stundennachweis {name} – KW {iso_week:02d}/{iso_year}" + (" (korrigiert)" if correction else "")
-            await self.mailer.send(
-                self.recipient, subject=subject, body=self._body(report, correction), attachments=[file]
-            )
+            suffix = {"first": "", "correction": " (korrigiert)", "resend": " (erneut gesendet)"}[kind]
+            subject = f"Stundennachweis {name} – KW {iso_week:02d}/{iso_year}{suffix}"
+            await self.mailer.send(self.recipient, subject=subject, body=self._body(report, kind), attachments=[file])
         except Exception as exc:  # noqa: BLE001 – ein Kunde darf den Versand der anderen nie verhindern
             if isinstance(exc, MailError):
                 LOG.error("Versand an %s für %s fehlgeschlagen: %s", self.recipient, name, exc)
@@ -132,7 +142,7 @@ class WeeklyReporter:
                 LOG.exception("Stundennachweis für %s KW %s/%s fehlgeschlagen", name, iso_week, iso_year)
             self.repo.log_report_run(customer_id, iso_year, iso_week, self.recipient, "failed", str(exc), snapshot)
             return CustomerResult(name, "failed", str(exc) or type(exc).__name__, file)
-        label = "Korrektur" if correction else ""
+        label = {"first": "", "correction": "Korrektur", "resend": "erneut gesendet"}[kind]
         self.repo.log_report_run(customer_id, iso_year, iso_week, self.recipient, "sent", None, snapshot)
         hints = [label] if label else []
         if report.untranslated:
@@ -156,16 +166,18 @@ class WeeklyReporter:
             recipient,
             subject=f"TEST – Stundennachweis {report.customer_name} – KW {iso.week:02d}/{iso.year}",
             body="Dies ist eine Testmail von ZeitFlow. Sie wurde nicht als Versand verbucht.\n\n"
-            + self._body(report, correction=False),
+            + self._body(report, "first"),
             attachments=[file],
         )
         return report.customer_name
 
-    def _body(self, report: WeekReport, correction: bool) -> str:
+    def _body(self, report: WeekReport, kind: str) -> str:
         hours = f"{report.total_minutes / 60:.2f}".replace(".", ",")
         notes = []
-        if correction:
+        if kind == "correction":
             notes.append("Dies ist eine korrigierte Fassung und ersetzt den zuvor versendeten Stundennachweis.")
+        elif kind == "resend":
+            notes.append("Unveränderte Kopie des bereits versendeten Stundennachweises.")
         if report.travel_count is None:
             notes.append("Das Feld „Anfahrten“ ist noch nachzutragen.")
         if report.untranslated:

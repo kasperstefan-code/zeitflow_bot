@@ -7,12 +7,11 @@ import logging
 from telegram import Bot, BotCommand, BotCommandScopeChat
 from telegram.error import TelegramError
 
-from zeitflow.i18n import COMMAND_DESCRIPTIONS, DEFAULT_LANG, WORKER_COMMANDS
+from zeitflow.i18n import COMMAND_DESCRIPTIONS, DEFAULT_LANG, WORKER_COMMANDS, t
 from zeitflow.models import Role, User
 
 LOG = logging.getLogger(__name__)
 
-FOREMAN_COMMANDS = [("export", "Stundennachweis als Excel")]
 ADMIN_COMMANDS = [
     ("mitarbeiter", "Mitarbeiter, Rollen, Freigaben"),
     ("kunden", "Kunden & Projekte anzeigen"),
@@ -42,7 +41,7 @@ async def set_user_commands(bot: Bot, user: User) -> None:
         if not user.is_active or not user.can_enter_for_others:
             await bot.delete_my_commands(scope=scope)
             return
-        extra = FOREMAN_COMMANDS + (ADMIN_COMMANDS if user.role is Role.ADMIN else [])
+        extra = [("export", t(user.lang, "cmd_export"))] + (ADMIN_COMMANDS if user.role is Role.ADMIN else [])
         await bot.set_my_commands(_worker_commands(user.lang) + [BotCommand(c, d) for c, d in extra], scope=scope)
     except TelegramError:
         LOG.warning("Befehlsmenü für %s nicht gesetzt (Chat unbekannt?)", user.name)

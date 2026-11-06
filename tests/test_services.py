@@ -49,7 +49,7 @@ async def test_inactive_or_pending_workers_are_rejected(service, world, repo):
 @pytest.mark.parametrize(
     "kwargs,code",
     [
-        ({"start": "10:00", "end": "09:00"}, "end_before_start"),
+        ({"start": "10:00", "end": "10:00"}, "end_before_start"),
         ({"brk": 700}, "bad_break"),
         ({"activity": "   "}, "activity"),
         ({"day": TODAY + timedelta(days=1)}, "future_date"),

@@ -3,12 +3,14 @@ from datetime import date
 import pytest
 
 from zeitflow.timeutil import (
-    intervals_overlap,
     iso_week_range,
+    parse_break,
     parse_date,
     parse_time,
     parse_week,
     short_name,
+    span,
+    spans_overlap,
     work_minutes,
 )
 
@@ -51,17 +53,28 @@ def test_parse_date_invalid():
 
 def test_work_minutes():
     assert work_minutes("06:30", "17:30", 60) == 600
+    assert work_minutes("20:00", "06:00", 30) == 570, "Nachtschicht über Mitternacht"
     with pytest.raises(ValueError):
-        work_minutes("10:00", "09:00", 0)
+        work_minutes("10:00", "10:00", 0)
     with pytest.raises(ValueError):
         work_minutes("10:00", "11:00", 60)
     with pytest.raises(ValueError):
         work_minutes("10:00", "11:00", -5)
 
 
-def test_intervals_overlap_touching_is_not_overlap():
-    assert intervals_overlap("06:00", "12:00", "11:00", "15:00")
-    assert not intervals_overlap("06:00", "12:00", "12:00", "15:00")
+def test_spans_overlap_across_midnight():
+    night = span(date(2026, 3, 24), "20:00", "06:00")
+    assert spans_overlap(night, span(date(2026, 3, 25), "05:00", "08:00"))
+    assert not spans_overlap(night, span(date(2026, 3, 25), "06:00", "14:00")), "Anschluss ist keine Überschneidung"
+    assert not spans_overlap(span(date(2026, 3, 24), "06:00", "12:00"), span(date(2026, 3, 24), "12:00", "15:00"))
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("30", 30), ("60 min", 60), ("1:00", 60), ("1h", 60), ("0,5", 30), ("1.30", 90), ("45мин", 45), ("x", None)],
+)
+def test_parse_break(raw, expected):
+    assert parse_break(raw) == expected
 
 
 def test_iso_week_range():

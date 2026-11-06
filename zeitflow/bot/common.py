@@ -7,7 +7,14 @@ from datetime import date
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
-from telegram.ext import BaseHandler, CommandHandler, ContextTypes, ConversationHandler, filters
+from telegram.ext import (
+    ApplicationHandlerStop,
+    BaseHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    filters,
+)
 
 from zeitflow.config import Settings
 from zeitflow.i18n import DEFAULT_LANG, t
@@ -113,9 +120,11 @@ class Dialog(ConversationHandler):
         return result if user_data.get(ACTIVE_DIALOG) == self.name else None
 
     async def handle_update(self, update, application, check_result, context):
+        result = await super().handle_update(update, application, check_result, context)
+        # Erst nach erfolgreichem Einstieg aktiv setzen – ein abgestürzter Einstieg darf keinen alten Dialog wecken.
         if check_result[2] in self.entry_points:
             context.user_data[ACTIVE_DIALOG] = self.name
-        return await super().handle_update(update, application, check_result, context)
+        return result
 
 
 def conversation(name: str, entry_points: list[BaseHandler], states: dict, timeout: int = 900) -> Dialog:
@@ -127,6 +136,30 @@ def bind_dialogs(application) -> None:
         for handler in group:
             if isinstance(handler, Dialog):
                 handler.application = application
+
+
+async def ignore_edits(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bearbeitete Nachrichten (auch Befehle) nie als neue Eingabe werten."""
+    raise ApplicationHandlerStop
+
+
+async def stale_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Button ohne passenden offenen Dialog (z. B. nach Timeout) – Rückmeldung statt Stille."""
+    user = deps(ctx).repo.get_user_by_telegram_id(update.effective_user.id)
+    await update.callback_query.answer(t(lang_of(user), "session_expired"), show_alert=True)
+    try:
+        await update.callback_query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+
+
+async def stray_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Text ohne offenen Dialog – z. B. eine Eingabe nach Ablauf der Sitzung."""
+    user = deps(ctx).repo.get_user_by_telegram_id(update.effective_user.id)
+    if user is None:
+        await update.message.reply_text(t(DEFAULT_LANG, "not_registered"))
+    else:
+        await update.message.reply_text(t(user.lang, "no_dialog"))
 
 
 def background(ctx: ContextTypes.DEFAULT_TYPE, coro: Coroutine, chat_id: int | None = None, lang: str = DEFAULT_LANG):
@@ -197,6 +230,8 @@ ERROR_TEXT_KEYS = {
     "future_date": "future_date",
     "too_old": "too_old",
     "activity": "ask_activity",
+    "inactive_worker": "inactive_worker",
+    "project": "project_inactive",
 }
 
 
