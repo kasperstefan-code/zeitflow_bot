@@ -10,7 +10,7 @@ from datetime import timedelta
 from zeitflow.export import RenderedFile, render_report
 from zeitflow.mailer import Mailer, MailError
 from zeitflow.repository import Repository, utc_stamp
-from zeitflow.services import TimesheetService, WeekReport, build_week_report
+from zeitflow.services import DayBlock, ReportRow, TimesheetService, WeekReport, build_week_report
 from zeitflow.timeutil import iso_week_range
 
 LOG = logging.getLogger(__name__)
@@ -139,6 +139,28 @@ class WeeklyReporter:
             hints.append(f"{report.untranslated} Tätigkeit(en) nicht übersetzt")
         return CustomerResult(name, "sent", ", ".join(hints), file)
 
+    async def send_test(self, recipient: str) -> str:
+        """Testmail mit Beispiel-Stundennachweis – wird NICHT protokolliert, beeinflusst also keinen echten Versand.
+
+        Nimmt die aktuelle KW des ersten Kunden mit Einträgen, sonst eine Beispielwoche. Wirft MailError.
+        """
+        iso = self.service.today().isocalendar()
+        monday, sunday = iso_week_range(iso.year, iso.week)
+        customers = self.repo.customers_with_entries(monday, sunday)
+        if customers:
+            report = build_week_report(self.repo, customers[0].id, iso.year, iso.week)
+        else:
+            report = _demo_report(monday, iso.year, iso.week)
+        file = render_report(report)
+        await self.mailer.send(
+            recipient,
+            subject=f"TEST – Stundennachweis {report.customer_name} – KW {iso.week:02d}/{iso.year}",
+            body="Dies ist eine Testmail von ZeitFlow. Sie wurde nicht als Versand verbucht.\n\n"
+            + self._body(report, correction=False),
+            attachments=[file],
+        )
+        return report.customer_name
+
     def _body(self, report: WeekReport, correction: bool) -> str:
         hours = f"{report.total_minutes / 60:.2f}".replace(".", ",")
         notes = []
@@ -155,3 +177,9 @@ class WeeklyReporter:
             + "".join(f"{n}\n" for n in notes)
             + f"\nDiese E-Mail wurde automatisch von ZeitFlow erstellt.{sender}"
         )
+
+
+def _demo_report(monday, iso_year: int, iso_week: int) -> WeekReport:
+    row = ReportRow("M. Mustermann", "Beispiel: Montage Rohrleitung DN50", "12345", "07:00", 30, "15:30", 480)
+    days = [DayBlock(monday + timedelta(days=i), [row] if i == 0 else []) for i in range(7)]
+    return WeekReport(0, "Beispielkunde (Test)", ["Beispielprojekt"], iso_year, iso_week, days, None)

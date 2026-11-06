@@ -21,6 +21,7 @@ ADMIN_COMMANDS = [
     ("projekt", "Projekt ändern/deaktivieren"),
     ("anfahrt", "Anfahrten je Kunde/KW"),
     ("versenden", "Stundennachweise jetzt senden"),
+    ("testmail", "Testmail an eine Adresse senden"),
 ]
 
 

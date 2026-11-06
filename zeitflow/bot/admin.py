@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from datetime import timedelta
 
 from telegram import Update
@@ -22,6 +23,7 @@ from zeitflow.bot.common import TEXT, background, conversation, current_user, de
 from zeitflow.bot.menu import set_user_commands
 from zeitflow.export import render_report
 from zeitflow.i18n import t
+from zeitflow.mailer import MailError
 from zeitflow.models import Role, UserStatus
 from zeitflow.reporting import WeeklyRunResult
 from zeitflow.services import build_week_report
@@ -30,6 +32,7 @@ from zeitflow.timeutil import iso_week_range, parse_week
 LOG = logging.getLogger(__name__)
 ROLE_LABELS = {Role.EMPLOYEE: "👤 Mitarbeiter", Role.FOREMAN: "🦺 Vorarbeiter", Role.ADMIN: "👑 Admin"}
 STATUS_LABELS = {UserStatus.PENDING: "⏳ wartet", UserStatus.ACTIVE: "", UserStatus.INACTIVE: "⛔ gesperrt"}
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 EXPIRED = "Sitzung abgelaufen, bitte den Befehl neu starten."
 
 
@@ -427,6 +430,29 @@ async def on_send_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def cmd_testmail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/testmail [adresse] – Beispiel-Stundennachweis senden, ohne einen echten Versand zu verbuchen."""
+    user = await current_user(update, ctx, min_role=Role.ADMIN)
+    if user is None:
+        return
+    recipient = ctx.args[0] if ctx.args else deps(ctx).settings.report_recipient
+    if not recipient or not EMAIL_RE.fullmatch(recipient):
+        await update.message.reply_text("Bitte so aufrufen: /testmail name@firma.de")
+        return
+    await update.message.reply_text(f"⏳ Sende Testmail an {recipient} …")
+    chat_id = update.effective_chat.id
+    background(ctx, _send_testmail(ctx, chat_id, recipient), chat_id, user.lang)
+
+
+async def _send_testmail(ctx, chat_id: int, recipient: str) -> None:
+    try:
+        customer = await deps(ctx).reporter.send_test(recipient)
+    except MailError as exc:
+        await ctx.bot.send_message(chat_id, f"❌ Testmail fehlgeschlagen:\n{exc}")
+        return
+    await ctx.bot.send_message(chat_id, f"✅ Testmail an {recipient} versendet ({customer}).")
+
+
 async def _run_send(ctx, chat_id: int, year: int, week: int, force: bool) -> None:
     result = await deps(ctx).reporter.run(year, week, force=force)
     await deliver_result(ctx, result, chat_ids=[chat_id])
@@ -457,6 +483,7 @@ def handlers():
             on_user_action, pattern=r"^(mr:\d+:(employee|foreman|admin)|ms:\d+:(active|inactive)|ml)$"
         ),
         CommandHandler("kunden", cmd_kunden),
+        CommandHandler("testmail", cmd_testmail),
         conversation(
             "neuerkunde",
             [CommandHandler("neuerkunde", cmd_neuerkunde)],

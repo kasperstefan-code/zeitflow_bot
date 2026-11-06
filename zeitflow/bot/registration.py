@@ -35,7 +35,8 @@ def menu_text(user) -> str:
         text += (
             "\n\n👑 Büro:\n/mitarbeiter – Mitarbeiter, Rollen, Freigaben\n/kunden – Kunden & Projekte\n"
             "/neuerkunde – Kunde anlegen\n/neuesprojekt – Projekt anlegen\n/projekt – Projekt ändern\n"
-            "/anfahrt – Anfahrten je Kunde/KW\n/versenden – Stundennachweise jetzt per E-Mail senden"
+            "/anfahrt – Anfahrten je Kunde/KW\n/versenden – Stundennachweise jetzt per E-Mail senden\n"
+            "/testmail adresse – Testmail (wird nicht als Versand verbucht)"
         )
     return text
 

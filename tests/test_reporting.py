@@ -149,3 +149,21 @@ async def test_unexpected_error_for_one_customer_does_not_stop_the_others(repo, 
 async def test_translation_budget_is_respected(repo, world):
     service = seed(repo, world, FakeTranslator(fail=True))
     assert await service.translate_pending(date(2026, 3, 23), date(2026, 3, 29), max_seconds=0) == 2
+
+
+async def test_testmail_uses_real_week_but_is_not_logged(repo, world):
+    mailer = FakeMailer()
+    reporter = WeeklyReporter(repo, seed(repo, world), mailer, "abrechnung@example.org")
+    customer = await reporter.send_test("stefan@example.org")
+    assert customer == "Brauerei Rothaus"
+    assert mailer.sent[0]["recipient"] == "stefan@example.org"
+    assert mailer.sent[0]["subject"].startswith("TEST – Stundennachweis")
+    assert repo.unsent_changed_weeks(), "echte Woche bleibt unversendet"
+    assert not repo.report_already_sent(world["other"].id, 2026, 13)
+
+
+async def test_testmail_without_entries_sends_demo(repo, world):
+    mailer = FakeMailer()
+    reporter = WeeklyReporter(repo, make_service(repo, FakeTranslator()), mailer, "a@example.org")
+    assert await reporter.send_test("stefan@example.org") == "Beispielkunde (Test)"
+    assert mailer.sent[0]["attachments"][0].filename.startswith("Stundennachweis_Beispielkunde")

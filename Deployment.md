@@ -20,6 +20,7 @@ zentrale Abrechnungsadresse.
 | Admin | `/kunden`, `/neuerkunde`, `/neuesprojekt`, `/projekt` | Stammdaten inkl. Kostenstelle |
 | Admin | `/anfahrt` | Anzahl Anfahrten je Kunde und KW nachtragen |
 | Admin | `/versenden` | Versand sofort auslösen (offene oder alle erneut) |
+| Admin | `/testmail adresse` | Beispiel-Stundennachweis an beliebige Adresse – wird nicht als Versand verbucht |
 
 Sprachen der Monteur-Oberfläche: Deutsch, Russisch, Ukrainisch, Polnisch, Litauisch.
 Büro-Befehle sind deutsch.
@@ -79,6 +80,8 @@ ANTHROPIC_API_KEY, ZEITFLOW_REPORT_EMAIL, ZEITFLOW_SMTP_HOST/USER/PASSWORD/FROM
 4. Deployen. Im Log erscheint `ZeitFlow gestartet …`. Fehlt `ZEITFLOW_ADMIN_IDS` und gibt es noch keinen
    Admin, bricht der Start bewusst ab (sonst könnte ein Fremder Admin werden).
 5. In Telegram `/start` senden (als Admin-ID aus `ZEITFLOW_ADMIN_IDS`), dann Kunden und Projekte anlegen.
+6. Mailversand prüfen: `/testmail name@firma.de`. Bei GMX muss im Postfach unter *Einstellungen → POP3 & IMAP*
+   der externe Zugriff erlaubt sein, und `ZEITFLOW_SMTP_FROM` muss die GMX-Adresse sein.
 
 Render o. ä.: Start-Befehl `python -m zeitflow`, persistente Disk unter `/data`.
 

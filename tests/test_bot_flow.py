@@ -503,3 +503,14 @@ async def test_failing_export_tells_the_user(bot, monkeypatch, caplog):
     await bot.press(FOREMAN_TG, f"xc:{iso.year}:{iso.week}:{bot.project.customer_id}")
     assert bot.req.texts(FOREMAN_TG)[-1] == "Произошла ошибка. Попробуйте ещё раз."
     caplog.clear()  # erwarteter Fehler – nicht als unerwarteter Bot-Fehler werten
+
+
+async def test_testmail_command(bot):
+    await bot.send(ADMIN_TG, "/testmail kaputt")
+    assert bot.req.texts(ADMIN_TG)[-1] == "Bitte so aufrufen: /testmail name@firma.de"
+    await bot.send(ADMIN_TG, "/testmail stefan@example.org")
+    assert bot.mailer.sent[-1]["recipient"] == "stefan@example.org"
+    assert bot.req.texts(ADMIN_TG)[-1].startswith("✅ Testmail an stefan@example.org versendet")
+    assert not bot.deps.repo.report_already_sent(bot.project.customer_id, *bot.deps.today().isocalendar()[:2])
+    await bot.send(WORKER_TG, "/testmail stefan@example.org")
+    assert bot.req.texts(WORKER_TG)[-1] == "Brak uprawnień."
