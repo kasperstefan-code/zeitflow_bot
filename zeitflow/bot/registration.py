@@ -14,7 +14,7 @@ from telegram.ext import (
     filters,
 )
 
-from zeitflow.bot.common import current_user, deps, keyboard, reply
+from zeitflow.bot.common import conversation, current_user, deps, keyboard, reply
 from zeitflow.i18n import DEFAULT_LANG, LANGUAGES, t
 from zeitflow.models import Role, UserStatus
 
@@ -74,11 +74,7 @@ async def reg_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if d.repo.get_user_by_telegram_id(tg_id):
         return ConversationHandler.END
 
-    configured_admin = tg_id in d.settings.admin_telegram_ids
-    bootstrap_admin = not d.settings.admin_telegram_ids and not d.repo.has_admin()
-    if configured_admin or bootstrap_admin:
-        if bootstrap_admin:
-            LOG.warning("Kein Admin konfiguriert – erster Nutzer %s wird Admin. ZEITFLOW_ADMIN_IDS setzen!", tg_id)
+    if tg_id in d.settings.admin_telegram_ids:
         user = d.repo.create_user(tg_id, name, lang, Role.ADMIN, UserStatus.ACTIVE)
         await update.message.reply_text(menu_text(user))
         return ConversationHandler.END
@@ -139,24 +135,15 @@ async def cmd_hilfe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(menu_text(user))
 
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = deps(ctx).repo.get_user_by_telegram_id(update.effective_user.id)
-    ctx.user_data.clear()
-    await reply(update, t(user.lang if user else DEFAULT_LANG, "cancelled"))
-    return ConversationHandler.END
-
-
 def handlers():
-    registration = ConversationHandler(
-        entry_points=[CommandHandler("start", cmd_start)],
-        states={
+    registration = conversation(
+        [CommandHandler("start", cmd_start)],
+        {
             REG_NAME: [
                 CallbackQueryHandler(reg_lang, pattern=r"^rl:"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name),
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        conversation_timeout=900,
     )
     return [
         registration,

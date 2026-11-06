@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
+from datetime import timedelta
 
 import pytest
 from telegram import Update
@@ -98,6 +100,15 @@ class Harness:
 
     async def _process(self, data):
         await self.app.process_update(Update.de_json(data, self.app.bot))
+        await self.drain()
+
+    async def drain(self):
+        """Wartet auf Hintergrund-Tasks (Übersetzung, Export, Versand, Neuzustellung von Befehlen)."""
+        for _ in range(20):
+            pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+            if not pending:
+                return
+            await asyncio.wait(pending, timeout=5)
 
 
 @pytest.fixture
@@ -200,7 +211,7 @@ async def test_worker_cannot_use_office_commands(bot):
 async def test_correction_and_export(bot):
     repo, service = bot.deps.repo, bot.deps.service
     today = bot.deps.today()
-    await service.record(draft([bot.worker.id], bot.project.id, day=today, lang="pl"), bot.worker)
+    service.record(draft([bot.worker.id], bot.project.id, day=today, lang="pl"), bot.worker)
     (entry,) = repo.list_entries()
 
     await bot.send(WORKER_TG, "/korrektur")
@@ -212,24 +223,24 @@ async def test_correction_and_export(bot):
     iso = today.isocalendar()
     await bot.send(FOREMAN_TG, "/export")
     await bot.press(FOREMAN_TG, f"xw:{iso.year}:{iso.week}")
-    await bot.press(FOREMAN_TG, f"xc:{bot.project.customer_id}")
+    await bot.press(FOREMAN_TG, f"xc:{iso.year}:{iso.week}:{bot.project.customer_id}")
     docs = [p for n, p in bot.req.calls if n == "sendDocument"]
     assert len(docs) == 1
 
 
 async def test_admin_manual_send(bot):
     today = bot.deps.today()
-    await bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=today), bot.admin)
+    bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=today), bot.admin)
     iso = today.isocalendar()
     await bot.send(ADMIN_TG, "/anfahrt")
     await bot.press(ADMIN_TG, f"tw:{iso.year}:{iso.week}")
-    await bot.press(ADMIN_TG, f"tc:{bot.project.customer_id}")
+    await bot.press(ADMIN_TG, f"tc:{iso.year}:{iso.week}:{bot.project.customer_id}")
     await bot.send(ADMIN_TG, "3")
     assert bot.deps.repo.get_travel_count(bot.project.customer_id, iso.year, iso.week) == 3
 
     await bot.send(ADMIN_TG, "/versenden")
     await bot.press(ADMIN_TG, f"sw:{iso.year}:{iso.week}")
-    await bot.press(ADMIN_TG, "sm:open")
+    await bot.press(ADMIN_TG, f"sm:open:{iso.year}:{iso.week}")
     assert len(bot.mailer.sent) == 1
     assert any("✅ Schwarzwaldmilch GmbH Freiburg" in t for t in bot.req.texts(ADMIN_TG))
 
@@ -243,3 +254,102 @@ async def test_admin_manages_roles(bot):
     assert bot.deps.repo.get_user(bot.worker.id).status is UserStatus.INACTIVE
     await bot.press(ADMIN_TG, f"mr:{bot.admin.id}:employee")
     assert bot.deps.repo.get_user(bot.admin.id).role is Role.ADMIN, "Admin kann sich nicht selbst herabstufen"
+
+
+async def test_new_command_ends_open_dialog_and_runs(bot):
+    """Befund 1: Text für /neuerkunde darf nicht im offenen /zeit-Dialog landen."""
+    today = bot.deps.today()
+    await bot.send(ADMIN_TG, "/zeit")
+    await bot.press(ADMIN_TG, "w:next")
+    await bot.press(ADMIN_TG, f"d:{today.isoformat()}")
+    await bot.send(ADMIN_TG, "/neuerkunde")
+    assert bot.req.texts(ADMIN_TG)[-1] == "Name des Kunden?"
+    await bot.send(ADMIN_TG, "Brauerei Rothaus")
+    assert "Brauerei Rothaus" in [c.name for c in bot.deps.repo.list_customers()]
+    await bot.send(ADMIN_TG, "07:00")
+    assert bot.deps.repo.list_entries() == [], "Der alte /zeit-Dialog ist beendet"
+
+
+async def test_correction_not_swallowed_by_open_entry_dialog(bot):
+    today = bot.deps.today()
+    (entry_id,) = bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=today), bot.worker).entry_ids
+    await bot.send(WORKER_TG, "/zeit")
+    await bot.press(WORKER_TG, f"d:{today.isoformat()}")  # wartet jetzt auf Beginn
+    await bot.send(WORKER_TG, "/korrektur")
+    await bot.press(WORKER_TG, f"k:{entry_id}")
+    await bot.press(WORKER_TG, "kf:start")
+    await bot.send(WORKER_TG, "07:30")
+    assert bot.deps.repo.get_entry(entry_id).start_time == "07:30"
+
+
+async def test_stale_week_button_cannot_cross_dialogs(bot):
+    """Befund 2: /anfahrt KW A, dann /export KW B, dann alter Kunden-Button aus /anfahrt → keine Fehlbuchung."""
+    today = bot.deps.today()
+    last_week = today - timedelta(days=7)
+    bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=today), bot.worker)
+    bot.deps.service.record(draft([bot.worker.id], bot.project.id, day=last_week), bot.admin)
+    cur, prev = today.isocalendar(), last_week.isocalendar()
+    cid = bot.project.customer_id
+
+    await bot.send(ADMIN_TG, "/anfahrt")
+    await bot.press(ADMIN_TG, f"tw:{cur.year}:{cur.week}")
+    stale_button = f"tc:{cur.year}:{cur.week}:{cid}"
+    assert stale_button in [d for _, d in bot.req.last_buttons()]
+
+    await bot.send(ADMIN_TG, "/export")
+    await bot.press(ADMIN_TG, f"xw:{prev.year}:{prev.week}")
+    await bot.press(ADMIN_TG, stale_button)  # gehört zum beendeten /anfahrt-Dialog
+    await bot.send(ADMIN_TG, "4")
+    assert bot.deps.repo.get_travel_count(cid, prev.year, prev.week) is None
+    assert bot.deps.repo.get_travel_count(cid, cur.year, cur.week) is None
+
+    await bot.send(ADMIN_TG, "/anfahrt")
+    await bot.press(ADMIN_TG, f"tw:{prev.year}:{prev.week}")
+    await bot.press(ADMIN_TG, f"tc:{prev.year}:{prev.week}:{cid}")
+    await bot.send(ADMIN_TG, "4")
+    assert bot.deps.repo.get_travel_count(cid, prev.year, prev.week) == 4
+
+
+async def test_translation_arrives_as_follow_up_message(bot):
+    await bot.send(WORKER_TG, "/zeit")
+    await bot.press(WORKER_TG, f"d:{bot.deps.today().isoformat()}")
+    await bot.press(WORKER_TG, "t:07:00")
+    await bot.press(WORKER_TG, "t:15:00")
+    await bot.press(WORKER_TG, "b:30")
+    await bot.send(WORKER_TG, "Izolacja rur")
+    await bot.press(WORKER_TG, "ok")
+    texts = bot.req.texts(WORKER_TG)
+    assert any("Tłumaczenie zostanie wykonane automatycznie." in x for x in texts)
+    assert "🇩🇪 DE:Izolacja rur" in texts
+    assert bot.deps.repo.list_entries()[0].activity_de == "DE:Izolacja rur"
+
+
+async def test_unknown_user_never_becomes_admin(bot):
+    bot.deps.repo.update_user(bot.admin.id, status=UserStatus.INACTIVE)
+    await bot.send(NEW_TG, "/start")
+    await bot.press(NEW_TG, "rl:de")
+    await bot.send(NEW_TG, "Fremder Mensch")
+    assert bot.deps.repo.get_user_by_telegram_id(NEW_TG).role is Role.EMPLOYEE
+    assert bot.deps.repo.get_user_by_telegram_id(NEW_TG).status is UserStatus.PENDING
+
+
+async def test_forged_buttons_are_rejected(bot):
+    pending = bot.deps.repo.create_user(555, "Gesperrt Er", "de", Role.EMPLOYEE, UserStatus.PENDING)
+    await bot.send(FOREMAN_TG, "/zeit")
+    await bot.press(FOREMAN_TG, f"w:{pending.id}")
+    assert ("▫️ Gesperrt Er", f"w:{pending.id}") not in bot.req.last_buttons()
+    await bot.press(FOREMAN_TG, "w:next")
+    await bot.press(FOREMAN_TG, f"d:{bot.deps.today().isoformat()}")
+    await bot.press(FOREMAN_TG, "t:06:00")
+    await bot.press(FOREMAN_TG, "t:15:00")
+    await bot.press(FOREMAN_TG, "b:30")
+    await bot.send(FOREMAN_TG, "Монтаж")
+    await bot.press(FOREMAN_TG, "ok")
+    assert {e.user_id for e in bot.deps.repo.list_entries()} == {bot.foreman.id}
+
+    admin_entry = bot.deps.service.record(
+        draft([bot.admin.id], bot.project.id, day=bot.deps.today(), start="16:00", end="18:00", brk=0), bot.admin
+    ).entry_ids[0]
+    await bot.send(FOREMAN_TG, "/korrektur")
+    await bot.press(FOREMAN_TG, f"k:{admin_entry}")
+    assert bot.req.texts(FOREMAN_TG)[-1] == "Недостаточно прав."

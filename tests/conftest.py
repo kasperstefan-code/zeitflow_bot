@@ -24,16 +24,29 @@ class FakeTranslator:
 
 
 class FakeMailer:
-    def __init__(self, fail: bool = False):
+    def __init__(self, fail: bool = False, delay: float = 0.0):
         self.fail = fail
+        self.delay = delay
         self.sent: list[dict] = []
 
     async def send(self, recipient, subject, body, attachments):
+        import asyncio
+
         from zeitflow.mailer import MailError
 
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.fail:
             raise MailError("SMTP down")
         self.sent.append({"recipient": recipient, "subject": subject, "body": body, "attachments": attachments})
+
+
+# Fester Stichtag für Tests: Mittwoch der KW 13/2026
+TODAY = date(2026, 3, 25)
+
+
+def make_service(repo, translator) -> TimesheetService:
+    return TimesheetService(repo, translator, today=lambda: TODAY)
 
 
 @pytest.fixture
@@ -51,7 +64,7 @@ def translator():
 
 @pytest.fixture
 def service(repo, translator):
-    return TimesheetService(repo, translator)
+    return make_service(repo, translator)
 
 
 @pytest.fixture

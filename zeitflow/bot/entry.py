@@ -14,11 +14,22 @@ from telegram.ext import (
     filters,
 )
 
-from zeitflow.bot.common import chunk, current_user, deps, fmt_date, fmt_hours, keyboard, overlap_lines, reply
-from zeitflow.bot.registration import cancel
+from zeitflow.bot.common import (
+    background,
+    chunk,
+    conversation,
+    current_user,
+    deps,
+    error_text,
+    fmt_date,
+    fmt_hours,
+    keyboard,
+    overlap_lines,
+    reply,
+)
 from zeitflow.i18n import t
 from zeitflow.models import User
-from zeitflow.services import EntryDraft, OverlapError, ValidationError
+from zeitflow.services import EDIT_WINDOW_DAYS, MAX_PAST_DAYS, EntryDraft, OverlapError, ValidationError
 from zeitflow.timeutil import parse_date, parse_time, short_name, to_minutes, work_minutes
 
 (WORKERS, CUSTOMER, PROJECT, DATE, START, END, BREAK, ACTIVITY, CONFIRM, MORE) = range(10)
@@ -26,7 +37,6 @@ from zeitflow.timeutil import parse_date, parse_time, short_name, to_minutes, wo
 START_TIMES = ["06:00", "06:30", "07:00", "07:30", "08:00", "08:30"]
 END_TIMES = ["15:00", "15:30", "16:00", "16:30", "17:00", "17:30", "18:00", "18:30", "19:00"]
 BREAKS = [0, 15, 30, 45, 60]
-MAX_PAST_DAYS = 62
 MAX_ACTIVITY_LEN = 500
 
 
@@ -78,8 +88,10 @@ async def on_worker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     workers = draft.setdefault("workers", [])
     if worker_id in workers:
         workers.remove(worker_id)
-    elif deps(ctx).repo.get_user(worker_id):
-        workers.append(worker_id)
+    else:
+        worker = deps(ctx).repo.get_user(worker_id)
+        if worker is not None and worker.is_active:
+            workers.append(worker_id)
     await reply(update, t(user.lang, "pick_workers"), _workers_keyboard(ctx, user))
     return WORKERS
 
@@ -162,8 +174,8 @@ async def on_date(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if day > today:
         await reply(update, t(user.lang, "future_date"))
         return DATE
-    if day < today - timedelta(days=MAX_PAST_DAYS):
-        await reply(update, t(user.lang, "bad_date"))
+    if day < today - timedelta(days=MAX_PAST_DAYS if user.is_admin else EDIT_WINDOW_DAYS):
+        await reply(update, t(user.lang, "too_old"))
         return DATE
     _draft(ctx)["date"] = day.isoformat()
     return await _ask_start(update, ctx, user)
@@ -284,24 +296,22 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         activity=draft["activity"],
         source_lang=user.lang,
     )
+    service = deps(ctx).service
     try:
-        result = await deps(ctx).service.record(entry, user)
+        result = service.record(entry, user)
     except OverlapError as exc:
         await update.callback_query.edit_message_text(t(user.lang, "overlap", list=overlap_lines(exc.overlaps)))
         ctx.user_data.clear()
         return ConversationHandler.END
-    except ValidationError:
-        await update.callback_query.edit_message_text(t(user.lang, "error"))
+    except ValidationError as exc:
+        await update.callback_query.edit_message_text(error_text(user.lang, exc))
         ctx.user_data.clear()
         return ConversationHandler.END
 
+    background(ctx, _translate_and_report(ctx, update.effective_chat.id, user, result.entry_ids, result.activity))
     lines = [t(user.lang, "saved", count=len(result.entry_ids))]
     if user.lang != "de":
-        lines.append(
-            t(user.lang, "translated", text=result.activity_de)
-            if result.activity_de
-            else t(user.lang, "translation_pending")
-        )
+        lines.append(t(user.lang, "translation_pending"))
     lines.append("")
     lines.append(t(user.lang, "more"))
     for key in ("project_id", "start", "end", "break", "activity"):
@@ -309,6 +319,12 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     markup = keyboard([[(t(user.lang, "yes"), "m:y"), (t(user.lang, "no"), "m:n")]])
     await update.callback_query.edit_message_text("\n".join(lines), reply_markup=markup)
     return MORE
+
+
+async def _translate_and_report(ctx, chat_id: int, user: User, entry_ids: list[int], activity: str) -> None:
+    activity_de = await deps(ctx).service.translate_entries(entry_ids, activity, user.lang)
+    if activity_de and user.lang != "de":
+        await ctx.bot.send_message(chat_id, t(user.lang, "translated", text=activity_de))
 
 
 async def on_more(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -325,9 +341,9 @@ async def on_more(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def handlers():
     text = filters.TEXT & ~filters.COMMAND
     return [
-        ConversationHandler(
-            entry_points=[CommandHandler("zeit", cmd_zeit)],
-            states={
+        conversation(
+            [CommandHandler("zeit", cmd_zeit)],
+            {
                 WORKERS: [CallbackQueryHandler(on_worker, pattern=r"^w:")],
                 CUSTOMER: [CallbackQueryHandler(on_customer, pattern=r"^c:\d+$")],
                 PROJECT: [CallbackQueryHandler(on_project, pattern=r"^p:\d+$")],
@@ -339,8 +355,6 @@ def handlers():
                 CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^(ok|x)$")],
                 MORE: [CallbackQueryHandler(on_more, pattern=r"^m:[yn]$")],
             },
-            fallbacks=[CommandHandler("cancel", cancel), CommandHandler("zeit", cmd_zeit)],
-            conversation_timeout=1800,
-            allow_reentry=True,
+            timeout=1800,
         )
     ]

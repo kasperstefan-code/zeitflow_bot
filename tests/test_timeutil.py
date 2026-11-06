@@ -79,3 +79,9 @@ def test_short_name():
     assert short_name("Sergej Tyschenko") == "S. Tyschenko"
     assert short_name("Anna Maria von Berg") == "A. Maria von Berg"
     assert short_name("Kroll") == "Kroll"
+
+
+def test_short_date_around_new_year_means_previous_year():
+    """Befund 12: am 02.01.2027 meint "30.12." den 30.12.2026."""
+    assert parse_date("30.12.", date(2027, 1, 2)) == date(2026, 12, 30)
+    assert parse_date("29.2.", date(2025, 1, 2)) is None

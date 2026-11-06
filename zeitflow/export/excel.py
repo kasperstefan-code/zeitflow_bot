@@ -51,6 +51,14 @@ def _minutes_as_time(minutes: int) -> time:
     return time(min(hh, 23), mm)
 
 
+def _text(ws: Worksheet, row: int, col: int, value: str):
+    """Freitext immer als Text speichern – sonst wird z. B. "=..." als Formel ausgeführt."""
+    cell = ws.cell(row, col, value)
+    if isinstance(value, str):
+        cell.data_type = "s"
+    return cell
+
+
 def _style_row(ws: Worksheet, row: int, top: Side = THIN) -> None:
     for col in range(1, LAST_COL + 1):
         cell = ws.cell(row, col)
@@ -88,7 +96,7 @@ class ExcelRenderer:
             (5, "Projekt:", "; ".join(report.project_names)),
         ):
             ws.cell(row, COL_MONTEUR, label).font = FONT
-            ws.cell(row, COL_ACTIVITY, value).font = FONT
+            _text(ws, row, COL_ACTIVITY, value).font = FONT
             ws.merge_cells(start_row=row, start_column=COL_ACTIVITY, end_row=row, end_column=LAST_COL)
             ws.cell(row, COL_ACTIVITY).alignment = Alignment(horizontal="left", wrap_text=True)
             for col in range(COL_MONTEUR, LAST_COL + 1):
@@ -137,11 +145,11 @@ class ExcelRenderer:
 
             for i, r in enumerate(block.rows):
                 rr = row + i
-                ws.cell(rr, COL_MONTEUR, r.monteur)
-                act = ws.cell(rr, COL_ACTIVITY, r.activity)
+                _text(ws, rr, COL_MONTEUR, r.monteur)
+                act = _text(ws, rr, COL_ACTIVITY, r.activity)
                 act.font = FONT_ACTIVITY
                 act.alignment = Alignment(vertical="top", wrap_text=True)
-                ws.cell(rr, COL_COST, r.cost_center).alignment = Alignment(horizontal="center", vertical="top")
+                _text(ws, rr, COL_COST, r.cost_center).alignment = Alignment(horizontal="center", vertical="top")
                 for col, value in (
                     (COL_START, _hhmm(r.start_time)),
                     (COL_BREAK, _minutes_as_time(r.break_minutes)),
@@ -150,7 +158,7 @@ class ExcelRenderer:
                     c = ws.cell(rr, col, value)
                     c.number_format = TIME_FORMAT
                     c.alignment = Alignment(horizontal="center", vertical="top")
-                h = ws.cell(rr, COL_HOURS, round(r.work_minutes / 60, 2))
+                h = ws.cell(rr, COL_HOURS, r.work_minutes / 60)
                 h.number_format = HOURS_FORMAT
                 lines = max(1, math.ceil(len(r.activity) / ACTIVITY_CHARS_PER_LINE))
                 ws.row_dimensions[rr].height = ROW_HEIGHT * lines

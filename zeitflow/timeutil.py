@@ -38,10 +38,17 @@ def parse_date(raw: str, reference: date) -> date | None:
             pass
     m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.?", s)
     if m:
+        day, month = int(m.group(1)), int(m.group(2))
         try:
-            return date(reference.year, int(m.group(2)), int(m.group(1)))
+            candidate = date(reference.year, month, day)
         except ValueError:
             return None
+        if candidate > reference:  # "30.12." am 02.01. meint das Vorjahr
+            try:
+                candidate = date(reference.year - 1, month, day)
+            except ValueError:
+                return None
+        return candidate
     return None
 
 

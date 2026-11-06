@@ -40,9 +40,9 @@ def test_fresh_migration_is_idempotent(tmp_path):
     conn = connect(path)
     migrate(conn)
     migrate(conn)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"users", "customers", "projects", "entries", "week_extras", "report_runs"} <= tables
+    assert {"users", "customers", "projects", "entries", "week_extras", "report_runs", "week_changes"} <= tables
 
 
 def test_legacy_database_is_migrated(tmp_path):

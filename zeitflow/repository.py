@@ -67,6 +67,11 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def utc_stamp() -> str:
+    """Sortierbarer UTC-Zeitstempel mit Millisekunden (gleiches Format wie SQLite datetime('now') + .fff)."""
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
 class Repository:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -184,7 +189,41 @@ class Repository:
                     {**r, "work_date": r["work_date"].isoformat()},
                 )
                 ids.append(cur.lastrowid)
+                self._touch_entry(cur.lastrowid)
         return ids
+
+    # --- Änderungsprotokoll je Kunde/KW -------------------------------------------
+
+    def _entry_scope(self, entry_id: int) -> tuple[int, date] | None:
+        row = self.conn.execute(
+            "SELECT p.customer_id, e.work_date FROM entries e JOIN projects p ON p.id=e.project_id WHERE e.id=?",
+            (entry_id,),
+        ).fetchone()
+        return (row["customer_id"], date.fromisoformat(row["work_date"])) if row else None
+
+    def _touch(self, customer_id: int, iso_year: int, iso_week: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO week_changes (customer_id, iso_year, iso_week, changed_at) VALUES (?,?,?,?)
+            ON CONFLICT (customer_id, iso_year, iso_week) DO UPDATE SET changed_at=excluded.changed_at
+            """,
+            (customer_id, iso_year, iso_week, utc_stamp()),
+        )
+
+    def _touch_scope(self, scope: tuple[int, date] | None) -> None:
+        if scope:
+            iso = scope[1].isocalendar()
+            self._touch(scope[0], iso.year, iso.week)
+
+    def _touch_entry(self, entry_id: int) -> None:
+        self._touch_scope(self._entry_scope(entry_id))
+
+    def week_changed_at(self, customer_id: int, iso_year: int, iso_week: int) -> str | None:
+        row = self.conn.execute(
+            "SELECT changed_at FROM week_changes WHERE customer_id=? AND iso_year=? AND iso_week=?",
+            (customer_id, iso_year, iso_week),
+        ).fetchone()
+        return row["changed_at"] if row else None
 
     def get_entry(self, entry_id: int) -> Entry | None:
         row = self.conn.execute(_ENTRY_SELECT + " WHERE e.id=?", (entry_id,)).fetchone()
@@ -255,17 +294,32 @@ class Repository:
         values = [v.isoformat() if isinstance(v, date) else v for v in fields.values()]
         cols = ", ".join(f"{k}=?" for k in fields)
         with transaction(self.conn):
+            before = self._entry_scope(entry_id)
             self.conn.execute(
                 f"UPDATE entries SET {cols}, updated_by=?, updated_at=? WHERE id=?",
                 (*values, actor_id, _now(), entry_id),
             )
+            # Datum oder Projekt können Woche/Kunde wechseln – beide Seiten markieren.
+            self._touch_scope(before)
+            self._touch_entry(entry_id)
 
-    def set_translation(self, entry_ids: Iterable[int], activity_de: str) -> None:
+    def set_translation(self, entry_ids: Iterable[int], activity_original: str, activity_de: str) -> list[int]:
+        """Setzt die Übersetzung nur, wenn der Text inzwischen nicht geändert oder anders übersetzt wurde."""
+        updated = []
         with transaction(self.conn):
-            self.conn.executemany("UPDATE entries SET activity_de=? WHERE id=?", [(activity_de, i) for i in entry_ids])
+            for entry_id in entry_ids:
+                cur = self.conn.execute(
+                    "UPDATE entries SET activity_de=? WHERE id=? AND activity_de IS NULL AND activity_original=?",
+                    (activity_de, entry_id, activity_original),
+                )
+                if cur.rowcount:
+                    updated.append(entry_id)
+                    self._touch_entry(entry_id)
+        return updated
 
     def delete_entry(self, entry_id: int) -> None:
         with transaction(self.conn):
+            self._touch_entry(entry_id)
             self.conn.execute("DELETE FROM entries WHERE id=?", (entry_id,))
 
     # --- Wochen-Zusatzdaten & Versandprotokoll -----------------------------------
@@ -286,20 +340,63 @@ class Repository:
                 """,
                 (customer_id, iso_year, iso_week, count),
             )
+            self._touch(customer_id, iso_year, iso_week)
 
     def log_report_run(
-        self, customer_id: int, iso_year: int, iso_week: int, recipient: str, status: str, error: str | None = None
+        self,
+        customer_id: int,
+        iso_year: int,
+        iso_week: int,
+        recipient: str,
+        status: str,
+        error: str | None = None,
+        snapshot_at: str | None = None,
     ) -> None:
+        """snapshot_at = Zeitpunkt, zu dem der versendete Datenstand gelesen wurde."""
         with transaction(self.conn):
             self.conn.execute(
-                "INSERT INTO report_runs (customer_id, iso_year, iso_week, recipient, status, error) "
-                "VALUES (?,?,?,?,?,?)",
-                (customer_id, iso_year, iso_week, recipient, status, error),
+                "INSERT INTO report_runs (customer_id, iso_year, iso_week, recipient, status, error, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (customer_id, iso_year, iso_week, recipient, status, error, snapshot_at or utc_stamp()),
             )
 
-    def report_already_sent(self, customer_id: int, iso_year: int, iso_week: int) -> bool:
+    def last_sent_at(self, customer_id: int, iso_year: int, iso_week: int) -> str | None:
         row = self.conn.execute(
-            "SELECT 1 FROM report_runs WHERE customer_id=? AND iso_year=? AND iso_week=? AND status='sent'",
+            "SELECT MAX(created_at) AS t FROM report_runs "
+            "WHERE customer_id=? AND iso_year=? AND iso_week=? AND status='sent'",
             (customer_id, iso_year, iso_week),
         ).fetchone()
-        return row is not None
+        return row["t"]
+
+    def report_already_sent(self, customer_id: int, iso_year: int, iso_week: int) -> bool:
+        return self.last_sent_at(customer_id, iso_year, iso_week) is not None
+
+    def weeks_needing_resend(self) -> list[tuple[int, int]]:
+        """KWs mit Änderungen nach dem letzten Versand oder mit fehlgeschlagenem, nie geglücktem Versand."""
+        rows = self.conn.execute(
+            """
+            WITH sent AS (
+                SELECT customer_id, iso_year, iso_week, MAX(created_at) AS sent_at
+                FROM report_runs WHERE status='sent' GROUP BY customer_id, iso_year, iso_week
+            )
+            SELECT w.iso_year, w.iso_week FROM week_changes w
+            JOIN sent s USING (customer_id, iso_year, iso_week)
+            WHERE w.changed_at > s.sent_at
+            UNION
+            SELECT r.iso_year, r.iso_week FROM report_runs r
+            LEFT JOIN sent s USING (customer_id, iso_year, iso_week)
+            WHERE r.status='failed' AND s.sent_at IS NULL
+            ORDER BY 1, 2
+            """
+        ).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def customers_sent_for_week(self, iso_year: int, iso_week: int) -> list[Customer]:
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT c.* FROM report_runs r JOIN customers c ON c.id = r.customer_id
+            WHERE r.iso_year=? AND r.iso_week=? AND r.status='sent' ORDER BY c.name
+            """,
+            (iso_year, iso_week),
+        ).fetchall()
+        return [Customer(r["id"], r["name"], bool(r["active"])) for r in rows]

@@ -169,7 +169,22 @@ def _copy_legacy_data(conn: sqlite3.Connection) -> None:
     )
 
 
-MIGRATIONS = [_migrate_v1]
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    # Letzte inhaltliche Änderung je Kunde/KW – erkennt Nachträge nach dem Versand.
+    conn.execute(
+        """
+        CREATE TABLE week_changes (
+            customer_id  INTEGER NOT NULL REFERENCES customers(id),
+            iso_year     INTEGER NOT NULL,
+            iso_week     INTEGER NOT NULL,
+            changed_at   TEXT    NOT NULL,
+            PRIMARY KEY (customer_id, iso_year, iso_week)
+        )
+        """
+    )
+
+
+MIGRATIONS = [_migrate_v1, _migrate_v2]
 
 
 def migrate(conn: sqlite3.Connection) -> None:

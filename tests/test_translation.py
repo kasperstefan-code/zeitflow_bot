@@ -80,3 +80,11 @@ async def test_passthrough():
 def test_build_translator_without_key():
     assert isinstance(build_translator("", "m"), PassthroughTranslator)
     assert isinstance(build_translator("sk-test", "m"), ClaudeTranslator)
+
+
+async def test_unexpected_api_errors_return_none():
+    """Befund 13: z. B. eine ungültige API-Antwort darf den Wochenlauf nicht abbrechen."""
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    error = anthropic.APIResponseValidationError(response=httpx2.Response(200, request=request), body=None)
+    msgs = FakeMessages(error=error)
+    assert await ClaudeTranslator("k", "m", client=fake_client(msgs)).to_german("text", "ru") is None

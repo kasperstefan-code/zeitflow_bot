@@ -1,6 +1,7 @@
 import io
 from datetime import date, time, timedelta
 
+import pytest
 from openpyxl import load_workbook
 
 from zeitflow.export import render_report, report_filename
@@ -93,3 +94,24 @@ def test_week_and_dates_are_computed_per_week_across_year_boundary():
     assert ws["A6"].value == 2026 and ws["A8"].value == 1
     dates = [ws.cell(find_row(ws, 1, abbr) + 2, 1).value.date() for abbr in ("Mo.", "Mi.", "So.")]
     assert dates == [date(2025, 12, 29), date(2025, 12, 31), date(2026, 1, 4)]
+
+
+def test_user_text_is_never_a_formula():
+    """Befund 3: "=..." aus Tätigkeit, Name, Kunde oder Kostenstelle bleibt Text."""
+    evil = ReportRow("=X Y", '=HYPERLINK("http://x","klick")', "=1+1", "06:30", 0, "06:50", 20)
+    report = make_report({1: [evil]})
+    object.__setattr__(report, "customer_name", "=Kunde")
+    object.__setattr__(report, "project_names", ["=Projekt"])
+    _, ws = load(report)
+    tue = find_row(ws, 1, "Di.")
+    cells = [ws["C3"], ws["C5"], ws.cell(tue, 2), ws.cell(tue, 3), ws.cell(tue, 4)]
+    assert all(c.data_type == "s" for c in cells)
+    assert ws.cell(tue, 3).value == '=HYPERLINK("http://x","klick")'
+
+
+def test_hours_are_exact_not_rounded():
+    """Befund 8: 3 × 20 min = 1,00 h – nicht 0,99."""
+    rows = [ReportRow(f"M{i}", "x", "", "06:30", 0, "06:50", 20) for i in range(3)]
+    _, ws = load(make_report({1: rows}))
+    tue = find_row(ws, 1, "Di.")
+    assert sum(ws.cell(tue + i, 8).value for i in range(3)) == pytest.approx(1.0)

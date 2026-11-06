@@ -45,7 +45,7 @@ class PassthroughTranslator:
 class ClaudeTranslator:
     def __init__(self, api_key: str, model: str, client: anthropic.AsyncAnthropic | None = None):
         self.model = model
-        self.client = client or anthropic.AsyncAnthropic(api_key=api_key, max_retries=3, timeout=60.0)
+        self.client = client or anthropic.AsyncAnthropic(api_key=api_key, max_retries=2, timeout=30.0)
 
     async def to_german(self, text: str, source_lang: str) -> str | None:
         text = text.strip()
@@ -72,6 +72,9 @@ class ClaudeTranslator:
             return None
         except anthropic.APIConnectionError:
             LOG.warning("Übersetzung fehlgeschlagen: keine Verbindung zur Claude API")
+            return None
+        except anthropic.APIError:
+            LOG.exception("Übersetzung fehlgeschlagen: unerwartete API-Antwort")
             return None
 
         if response.stop_reason == "refusal":

@@ -1,4 +1,7 @@
-"""Büro-Funktionen (nur Deutsch): Stammdaten, Mitarbeiter, Anfahrten, Export, Versand."""
+"""Büro-Funktionen (nur Deutsch): Stammdaten, Mitarbeiter, Anfahrten, Export, Versand.
+
+Die gewählte KW steckt in den Callback-Daten der Folge-Buttons – so kann ein zweiter Dialog sie nicht überschreiben.
+"""
 
 from __future__ import annotations
 
@@ -16,8 +19,8 @@ from telegram.ext import (
     filters,
 )
 
-from zeitflow.bot.common import current_user, deps, keyboard, reply
-from zeitflow.bot.registration import cancel
+from zeitflow.bot.common import background, conversation, current_user, deps, keyboard, reply
+from zeitflow.bot.menu import set_user_commands
 from zeitflow.export import render_report
 from zeitflow.i18n import t
 from zeitflow.models import Role, UserStatus
@@ -29,6 +32,7 @@ LOG = logging.getLogger(__name__)
 TEXT = filters.TEXT & ~filters.COMMAND
 ROLE_LABELS = {Role.EMPLOYEE: "👤 Mitarbeiter", Role.FOREMAN: "🦺 Vorarbeiter", Role.ADMIN: "👑 Admin"}
 STATUS_LABELS = {UserStatus.PENDING: "⏳ wartet", UserStatus.ACTIVE: "", UserStatus.INACTIVE: "⛔ gesperrt"}
+EXPIRED = "Sitzung abgelaufen, bitte den Befehl neu starten."
 
 
 def _week_keyboard(ctx, prefix: str):
@@ -52,6 +56,10 @@ def _week_from(update: Update, ctx) -> tuple[int, int] | None:
     return parse_week(update.message.text, deps(ctx).today())
 
 
+def _callback_ints(update: Update) -> list[int]:
+    return [int(x) for x in update.callback_query.data.split(":")[1:]]
+
+
 # --- Mitarbeiter --------------------------------------------------------------------
 
 
@@ -70,7 +78,7 @@ async def _user_list(update: Update, ctx):
 async def on_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return
-    await _show_user(update, ctx, int(update.callback_query.data.split(":")[1]))
+    await _show_user(update, ctx, _callback_ints(update)[0])
 
 
 async def _show_user(update: Update, ctx, user_id: int):
@@ -114,6 +122,7 @@ async def on_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         repo.update_user(target.id, status=UserStatus(value))
         if value == "active" and was_pending:
             await ctx.bot.send_message(target.telegram_id, t(target.lang, "approved"))
+    await set_user_commands(ctx.bot, repo.get_user(target.id))
     await _show_user(update, ctx, target.id)
 
 
@@ -163,6 +172,7 @@ async def cmd_neuesprojekt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not customers:
         await update.message.reply_text("Zuerst einen Kunden anlegen: /neuerkunde")
         return ConversationHandler.END
+    ctx.user_data["np"] = {}
     await update.message.reply_text(
         "Für welchen Kunden?", reply_markup=keyboard([[(c.name, f"npc:{c.id}")] for c in customers])
     )
@@ -172,7 +182,7 @@ async def cmd_neuesprojekt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_np_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    ctx.user_data["np_customer"] = int(update.callback_query.data.split(":")[1])
+    ctx.user_data.setdefault("np", {})["customer"] = _callback_ints(update)[0]
     await reply(update, "Projektbezeichnung?")
     return NP_NAME
 
@@ -180,7 +190,7 @@ async def on_np_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_np_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    ctx.user_data["np_name"] = " ".join(update.message.text.split())
+    ctx.user_data.setdefault("np", {})["name"] = " ".join(update.message.text.split())
     await update.message.reply_text("Kostenstelle? (oder - für keine)")
     return NP_COST
 
@@ -188,14 +198,12 @@ async def on_np_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_np_cost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    cost = update.message.text.strip()
-    cost = "" if cost == "-" else cost
-    try:
-        project = deps(ctx).repo.create_project(ctx.user_data["np_customer"], ctx.user_data["np_name"], cost)
-    except KeyError:
-        await update.message.reply_text("Sitzung abgelaufen, bitte /neuesprojekt neu starten.")
+    state = ctx.user_data.pop("np", {})
+    if "customer" not in state or "name" not in state:
+        await update.message.reply_text(EXPIRED)
         return ConversationHandler.END
-    ctx.user_data.clear()
+    cost = update.message.text.strip()
+    project = deps(ctx).repo.create_project(state["customer"], state["name"], "" if cost == "-" else cost)
     await update.message.reply_text(
         f"✅ Projekt angelegt:\n🏢 {project.customer_name}\n📋 {project.name}\n🏷 {project.cost_center or '–'}"
     )
@@ -209,6 +217,7 @@ async def cmd_projekt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not projects:
         await update.message.reply_text("Keine aktiven Projekte.")
         return ConversationHandler.END
+    ctx.user_data["ep"] = {}
     rows = [[(f"{p.customer_name} · {p.name}"[:60], f"ep:{p.id}")] for p in projects]
     await update.message.reply_text("Welches Projekt?", reply_markup=keyboard(rows))
     return EP_PICK
@@ -217,7 +226,7 @@ async def cmd_projekt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_ep_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    ctx.user_data["ep_id"] = int(update.callback_query.data.split(":")[1])
+    ctx.user_data.setdefault("ep", {})["id"] = _callback_ints(update)[0]
     rows = [[("📋 Bezeichnung", "ef:name"), ("🏷 Kostenstelle", "ef:cost_center")], [("⛔ Deaktivieren", "ef:off")]]
     await reply(update, "Was ändern?", keyboard(rows))
     return EP_FIELD
@@ -226,13 +235,19 @@ async def on_ep_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_ep_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
+    state = ctx.user_data.get("ep", {})
+    if "id" not in state:
+        await reply(update, EXPIRED)
+        return ConversationHandler.END
     field = update.callback_query.data.split(":")[1]
     if field == "off":
-        deps(ctx).repo.update_project(ctx.user_data["ep_id"], active=0)
-        ctx.user_data.clear()
+        deps(ctx).repo.update_project(state["id"], active=0)
+        ctx.user_data.pop("ep", None)
         await reply(update, "✅ Projekt deaktiviert. Vorhandene Einträge bleiben erhalten.")
         return ConversationHandler.END
-    ctx.user_data["ep_field"] = field
+    if field not in ("name", "cost_center"):
+        return ConversationHandler.END
+    state["field"] = field
     await reply(update, "Neuer Wert?")
     return EP_VALUE
 
@@ -240,9 +255,11 @@ async def on_ep_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_ep_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    value = update.message.text.strip()
-    deps(ctx).repo.update_project(ctx.user_data["ep_id"], **{ctx.user_data["ep_field"]: value})
-    ctx.user_data.clear()
+    state = ctx.user_data.pop("ep", {})
+    if "id" not in state or "field" not in state:
+        await update.message.reply_text(EXPIRED)
+        return ConversationHandler.END
+    deps(ctx).repo.update_project(state["id"], **{state["field"]: update.message.text.strip()})
     await update.message.reply_text("✅ Gespeichert.")
     return ConversationHandler.END
 
@@ -260,18 +277,19 @@ async def cmd_anfahrt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _ask_week_customer(update: Update, ctx, prefix: str, next_state: int):
+    """Fragt den Kunden; die KW wandert in die Callback-Daten (prefix:Jahr:KW:Kunde)."""
     week = _week_from(update, ctx)
     if week is None:
         await reply(update, "KW nicht erkannt. Beispiel: 13/2026")
         return None
-    ctx.user_data["week"] = week
-    monday, sunday = iso_week_range(*week)
+    year, iso_week = week
+    monday, sunday = iso_week_range(year, iso_week)
     customers = deps(ctx).repo.customers_with_entries(monday, sunday)
     if not customers:
-        await reply(update, f"Keine Einträge in KW {week[1]:02d}/{week[0]}.")
+        await reply(update, f"Keine Einträge in KW {iso_week:02d}/{year}.")
         return ConversationHandler.END
-    rows = [[(c.name, f"{prefix}:{c.id}")] for c in customers]
-    await reply(update, f"KW {week[1]:02d}/{week[0]} – welcher Kunde?", keyboard(rows))
+    rows = [[(c.name, f"{prefix}:{year}:{iso_week}:{c.id}")] for c in customers]
+    await reply(update, f"KW {iso_week:02d}/{year} – welcher Kunde?", keyboard(rows))
     return next_state
 
 
@@ -285,11 +303,18 @@ async def on_tr_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_tr_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    customer_id = int(update.callback_query.data.split(":")[1])
-    ctx.user_data["customer_id"] = customer_id
-    year, week = ctx.user_data["week"]
+    year, week, customer_id = _callback_ints(update)
+    customer = deps(ctx).repo.get_customer(customer_id)
+    if customer is None:
+        await reply(update, "Kunde nicht gefunden.")
+        return ConversationHandler.END
+    ctx.user_data["anfahrt"] = (customer_id, year, week)
     current = deps(ctx).repo.get_travel_count(customer_id, year, week)
-    await reply(update, f"Anzahl Anfahrten? (aktuell: {current if current is not None else 'leer'}; - zum Leeren)")
+    await reply(
+        update,
+        f"{customer.name}, KW {week:02d}/{year}\nAnzahl Anfahrten? "
+        f"(aktuell: {current if current is not None else 'leer'}; - zum Leeren)",
+    )
     return TR_VALUE
 
 
@@ -300,10 +325,13 @@ async def on_tr_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if raw != "-" and not (raw.isdigit() and int(raw) <= 99):
         await update.message.reply_text("Bitte eine Zahl (0–99) oder - eingeben.")
         return TR_VALUE
-    year, week = ctx.user_data["week"]
-    deps(ctx).repo.set_travel_count(ctx.user_data["customer_id"], year, week, None if raw == "-" else int(raw))
-    ctx.user_data.clear()
-    await update.message.reply_text("✅ Anfahrten gespeichert.")
+    target = ctx.user_data.pop("anfahrt", None)
+    if target is None:
+        await update.message.reply_text(EXPIRED)
+        return ConversationHandler.END
+    customer_id, year, week = target
+    deps(ctx).repo.set_travel_count(customer_id, year, week, None if raw == "-" else int(raw))
+    await update.message.reply_text(f"✅ Anfahrten für KW {week:02d}/{year} gespeichert.")
     return ConversationHandler.END
 
 
@@ -329,10 +357,17 @@ async def on_ex_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_ex_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.FOREMAN) is None:
         return ConversationHandler.END
-    d = deps(ctx)
-    year, week = ctx.user_data["week"]
-    customer_id = int(update.callback_query.data.split(":")[1])
+    year, week, customer_id = _callback_ints(update)
+    if deps(ctx).repo.get_customer(customer_id) is None:
+        await reply(update, "Kunde nicht gefunden.")
+        return ConversationHandler.END
     await reply(update, "⏳ Erstelle Stundennachweis …")
+    background(ctx, _send_export(ctx, update.effective_chat.id, customer_id, year, week))
+    return ConversationHandler.END
+
+
+async def _send_export(ctx, chat_id: int, customer_id: int, year: int, week: int) -> None:
+    d = deps(ctx)
     monday, sunday = iso_week_range(year, week)
     await d.service.translate_pending(monday, sunday, customer_id=customer_id)
     report = build_week_report(d.repo, customer_id, year, week)
@@ -340,11 +375,7 @@ async def on_ex_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     caption = f"KW {week:02d}/{year} · {report.customer_name}"
     if report.untranslated:
         caption += f"\n⚠️ {report.untranslated} Tätigkeit(en) noch nicht übersetzt"
-    await ctx.bot.send_document(
-        update.effective_chat.id, document=io.BytesIO(file.content), filename=file.filename, caption=caption
-    )
-    ctx.user_data.clear()
-    return ConversationHandler.END
+    await ctx.bot.send_document(chat_id, document=io.BytesIO(file.content), filename=file.filename, caption=caption)
 
 
 # --- Versand (Admin) ----------------------------------------------------------------
@@ -370,20 +401,27 @@ async def on_send_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if week is None:
         await reply(update, "KW nicht erkannt. Beispiel: 13/2026")
         return SEND_WEEK
-    ctx.user_data["week"] = week
-    rows = [[("📨 Nur noch nicht versendete", "sm:open")], [("🔁 Alle erneut senden", "sm:all")]]
-    await reply(update, f"KW {week[1]:02d}/{week[0]}:", keyboard(rows))
+    year, iso_week = week
+    rows = [
+        [("📨 Neue und geänderte", f"sm:open:{year}:{iso_week}")],
+        [("🔁 Alle erneut senden", f"sm:all:{year}:{iso_week}")],
+    ]
+    await reply(update, f"KW {iso_week:02d}/{year}:", keyboard(rows))
     return SEND_MODE
 
 
 async def on_send_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    year, week = ctx.user_data.pop("week")
+    _, mode, year, week = update.callback_query.data.split(":")
     await reply(update, "⏳ Versand läuft …")
-    result = await deps(ctx).reporter.run(year, week, force=update.callback_query.data == "sm:all")
-    await deliver_result(ctx, result, chat_ids=[update.effective_chat.id])
+    background(ctx, _run_send(ctx, update.effective_chat.id, int(year), int(week), mode == "all"))
     return ConversationHandler.END
+
+
+async def _run_send(ctx, chat_id: int, year: int, week: int, force: bool) -> None:
+    result = await deps(ctx).reporter.run(year, week, force=force)
+    await deliver_result(ctx, result, chat_ids=[chat_id])
 
 
 async def deliver_result(ctx, result: WeeklyRunResult, chat_ids: list[int]) -> None:
@@ -391,8 +429,8 @@ async def deliver_result(ctx, result: WeeklyRunResult, chat_ids: list[int]) -> N
     for chat_id in chat_ids:
         try:
             await ctx.bot.send_message(chat_id, result.summary())
-            for r in result.results:
-                if r.status == "failed" and r.file:
+            for r in result.failed:
+                if r.file:
                     await ctx.bot.send_document(
                         chat_id,
                         document=io.BytesIO(r.file.content),
@@ -404,61 +442,56 @@ async def deliver_result(ctx, result: WeeklyRunResult, chat_ids: list[int]) -> N
 
 
 def handlers():
-    conv = dict(fallbacks=[CommandHandler("cancel", cancel)], conversation_timeout=900, allow_reentry=True)
     return [
         CommandHandler("mitarbeiter", cmd_mitarbeiter),
         CallbackQueryHandler(on_user, pattern=r"^mu:\d+$"),
-        CallbackQueryHandler(on_user_action, pattern=r"^(mr:\d+:\w+|ms:\d+:\w+|ml)$"),
-        CommandHandler("kunden", cmd_kunden),
-        ConversationHandler(
-            entry_points=[CommandHandler("neuerkunde", cmd_neuerkunde)],
-            states={NEW_CUSTOMER: [MessageHandler(TEXT, on_new_customer)]},
-            **conv,
+        CallbackQueryHandler(
+            on_user_action, pattern=r"^(mr:\d+:(employee|foreman|admin)|ms:\d+:(active|inactive)|ml)$"
         ),
-        ConversationHandler(
-            entry_points=[CommandHandler("neuesprojekt", cmd_neuesprojekt)],
-            states={
+        CommandHandler("kunden", cmd_kunden),
+        conversation(
+            [CommandHandler("neuerkunde", cmd_neuerkunde)],
+            {NEW_CUSTOMER: [MessageHandler(TEXT, on_new_customer)]},
+        ),
+        conversation(
+            [CommandHandler("neuesprojekt", cmd_neuesprojekt)],
+            {
                 NP_CUSTOMER: [CallbackQueryHandler(on_np_customer, pattern=r"^npc:\d+$")],
                 NP_NAME: [MessageHandler(TEXT, on_np_name)],
                 NP_COST: [MessageHandler(TEXT, on_np_cost)],
             },
-            **conv,
         ),
-        ConversationHandler(
-            entry_points=[CommandHandler("projekt", cmd_projekt)],
-            states={
+        conversation(
+            [CommandHandler("projekt", cmd_projekt)],
+            {
                 EP_PICK: [CallbackQueryHandler(on_ep_pick, pattern=r"^ep:\d+$")],
                 EP_FIELD: [CallbackQueryHandler(on_ep_field, pattern=r"^ef:\w+$")],
                 EP_VALUE: [MessageHandler(TEXT, on_ep_value)],
             },
-            **conv,
         ),
-        ConversationHandler(
-            entry_points=[CommandHandler("anfahrt", cmd_anfahrt)],
-            states={
+        conversation(
+            [CommandHandler("anfahrt", cmd_anfahrt)],
+            {
                 TR_WEEK: [CallbackQueryHandler(on_tr_week, pattern=r"^tw:\d+:\d+$"), MessageHandler(TEXT, on_tr_week)],
-                TR_CUSTOMER: [CallbackQueryHandler(on_tr_customer, pattern=r"^tc:\d+$")],
+                TR_CUSTOMER: [CallbackQueryHandler(on_tr_customer, pattern=r"^tc:\d+:\d+:\d+$")],
                 TR_VALUE: [MessageHandler(TEXT, on_tr_value)],
             },
-            **conv,
         ),
-        ConversationHandler(
-            entry_points=[CommandHandler("export", cmd_export)],
-            states={
+        conversation(
+            [CommandHandler("export", cmd_export)],
+            {
                 EX_WEEK: [CallbackQueryHandler(on_ex_week, pattern=r"^xw:\d+:\d+$"), MessageHandler(TEXT, on_ex_week)],
-                EX_CUSTOMER: [CallbackQueryHandler(on_ex_customer, pattern=r"^xc:\d+$")],
+                EX_CUSTOMER: [CallbackQueryHandler(on_ex_customer, pattern=r"^xc:\d+:\d+:\d+$")],
             },
-            **conv,
         ),
-        ConversationHandler(
-            entry_points=[CommandHandler("versenden", cmd_versenden)],
-            states={
+        conversation(
+            [CommandHandler("versenden", cmd_versenden)],
+            {
                 SEND_WEEK: [
                     CallbackQueryHandler(on_send_week, pattern=r"^sw:\d+:\d+$"),
                     MessageHandler(TEXT, on_send_week),
                 ],
-                SEND_MODE: [CallbackQueryHandler(on_send_mode, pattern=r"^sm:(open|all)$")],
+                SEND_MODE: [CallbackQueryHandler(on_send_mode, pattern=r"^sm:(open|all):\d+:\d+$")],
             },
-            **conv,
         ),
     ]

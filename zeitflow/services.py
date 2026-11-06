@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from zeitflow.models import Entry, User
+from zeitflow.models import Entry, Role, User
 from zeitflow.repository import Repository
-from zeitflow.timeutil import intervals_overlap, iso_week_range, short_name, work_minutes
+from zeitflow.timeutil import intervals_overlap, iso_week_range, short_name, to_minutes, work_minutes
 from zeitflow.translation import Translator
 
 UNTRANSLATED_PREFIX = "[nicht übersetzt] "
+EDIT_WINDOW_DAYS = 14
+MAX_PAST_DAYS = 62
+
+LOG = logging.getLogger(__name__)
 
 
 class ValidationError(ValueError):
-    pass
+    """code: maschinenlesbarer Grund, z. B. für die passende Bot-Meldung."""
+
+    def __init__(self, code: str, message: str = ""):
+        super().__init__(message or code)
+        self.code = code
 
 
 class PermissionDenied(PermissionError):
@@ -30,7 +40,7 @@ class Overlap:
 
 class OverlapError(ValidationError):
     def __init__(self, overlaps: list[Overlap]):
-        super().__init__("Zeitraum überschneidet sich mit vorhandenen Einträgen")
+        super().__init__("overlap", "Zeitraum überschneidet sich mit vorhandenen Einträgen")
         self.overlaps = overlaps
 
 
@@ -50,30 +60,52 @@ class EntryDraft:
 class RecordResult:
     entry_ids: list[int]
     work_minutes: int
-    activity_de: str | None
+    activity: str
+
+
+def _net_minutes(start: str, end: str, break_minutes: int) -> int:
+    if to_minutes(end) <= to_minutes(start):
+        raise ValidationError("end_before_start")
+    try:
+        return work_minutes(start, end, break_minutes)
+    except ValueError as exc:
+        raise ValidationError("bad_break", str(exc)) from exc
 
 
 class TimesheetService:
-    def __init__(self, repo: Repository, translator: Translator):
+    def __init__(self, repo: Repository, translator: Translator, today: Callable[[], date] = date.today):
         self.repo = repo
         self.translator = translator
+        self.today = today
 
     # --- Erfassung ----------------------------------------------------------------
 
-    async def record(self, draft: EntryDraft, actor: User) -> RecordResult:
+    def _check_date(self, day: date, actor: User) -> None:
+        today = self.today()
+        if day > today:
+            raise ValidationError("future_date")
+        oldest = today - timedelta(days=MAX_PAST_DAYS if actor.is_admin else EDIT_WINDOW_DAYS)
+        if day < oldest:
+            raise ValidationError("too_old")
+
+    def record(self, draft: EntryDraft, actor: User) -> RecordResult:
+        """Speichert sofort; die Übersetzung folgt separat über translate_entries()."""
         if not draft.user_ids:
-            raise ValidationError("Kein Monteur ausgewählt")
+            raise ValidationError("no_worker")
         if not actor.can_enter_for_others and set(draft.user_ids) != {actor.id}:
             raise PermissionDenied("Nur Vorarbeiter und Admins dürfen für andere erfassen")
+        for uid in draft.user_ids:
+            worker = self.repo.get_user(uid)
+            if worker is None or not worker.is_active:
+                raise ValidationError("inactive_worker")
         project = self.repo.get_project(draft.project_id)
         if project is None or not project.active:
-            raise ValidationError("Projekt nicht gefunden oder inaktiv")
-        if not draft.activity.strip():
-            raise ValidationError("Tätigkeit fehlt")
-        try:
-            minutes = work_minutes(draft.start_time, draft.end_time, draft.break_minutes)
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
+            raise ValidationError("project")
+        activity = draft.activity.strip()
+        if not activity:
+            raise ValidationError("activity")
+        self._check_date(draft.work_date, actor)
+        minutes = _net_minutes(draft.start_time, draft.end_time, draft.break_minutes)
 
         overlaps = []
         for uid in draft.user_ids:
@@ -90,18 +122,25 @@ class TimesheetService:
                 "end_time": draft.end_time,
                 "break_minutes": draft.break_minutes,
                 "work_minutes": minutes,
-                "activity_original": draft.activity.strip(),
+                "activity_original": activity,
                 "activity_de": None,
                 "source_lang": draft.source_lang,
                 "created_by": actor.id,
             }
             for uid in draft.user_ids
         )
-        # Erst speichern, dann übersetzen: ein API-Ausfall darf keine Erfassung verlieren.
-        activity_de = await self.translator.to_german(draft.activity, draft.source_lang)
-        if activity_de is not None:
-            self.repo.set_translation(ids, activity_de)
-        return RecordResult(entry_ids=ids, work_minutes=minutes, activity_de=activity_de)
+        return RecordResult(entry_ids=ids, work_minutes=minutes, activity=activity)
+
+    async def translate_entries(self, entry_ids: list[int], activity: str, source_lang: str) -> str | None:
+        """Übersetzt einen Text einmal für alle Einträge. Wurde der Text inzwischen geändert, bleibt er unberührt."""
+        try:
+            result = await self.translator.to_german(activity, source_lang)
+        except Exception:  # noqa: BLE001 – Übersetzung ist nachholbar, darf nie eine Erfassung stören
+            LOG.exception("Übersetzung fehlgeschlagen")
+            return None
+        if result is not None:
+            self.repo.set_translation(entry_ids, activity, result)
+        return result
 
     def _overlaps(self, user_id: int, day: date, start: str, end: str, ignore_id: int | None = None) -> list[Overlap]:
         return [
@@ -112,18 +151,29 @@ class TimesheetService:
 
     # --- Korrektur ----------------------------------------------------------------
 
-    def editable_entries(self, actor: User, today: date, days: int = 14, limit: int = 30) -> list[Entry]:
-        user_id = None if actor.can_enter_for_others else actor.id
-        return self.repo.list_entries(
-            user_id=user_id, date_from=today - timedelta(days=days), limit=limit, newest_first=True
-        )
+    def _may_edit(self, actor: User, entry: Entry) -> bool:
+        if actor.is_admin or entry.user_id == actor.id:
+            return True
+        if actor.role is Role.FOREMAN:
+            owner = self.repo.get_user(entry.user_id)
+            return entry.created_by == actor.id or (owner is not None and owner.role is Role.EMPLOYEE)
+        return False
 
-    def _editable(self, entry_id: int, actor: User) -> Entry:
+    def editable_entries(self, actor: User, limit: int = 30) -> list[Entry]:
+        days = MAX_PAST_DAYS if actor.is_admin else EDIT_WINDOW_DAYS
+        user_id = None if actor.can_enter_for_others else actor.id
+        candidates = self.repo.list_entries(
+            user_id=user_id, date_from=self.today() - timedelta(days=days), newest_first=True
+        )
+        return [e for e in candidates if self._may_edit(actor, e)][:limit]
+
+    def editable(self, entry_id: int, actor: User) -> Entry:
         entry = self.repo.get_entry(entry_id)
         if entry is None:
-            raise ValidationError("Eintrag nicht gefunden")
-        if entry.user_id != actor.id and not actor.can_enter_for_others:
+            raise ValidationError("not_found")
+        if not self._may_edit(actor, entry):
             raise PermissionDenied("Kein Zugriff auf diesen Eintrag")
+        self._check_date(entry.work_date, actor)
         return entry
 
     def change_times(
@@ -136,15 +186,13 @@ class TimesheetService:
         break_minutes: int | None = None,
         work_date: date | None = None,
     ) -> Entry:
-        entry = self._editable(entry_id, actor)
+        entry = self.editable(entry_id, actor)
         start = start_time or entry.start_time
         end = end_time or entry.end_time
         brk = entry.break_minutes if break_minutes is None else break_minutes
         day = work_date or entry.work_date
-        try:
-            minutes = work_minutes(start, end, brk)
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
+        self._check_date(day, actor)
+        minutes = _net_minutes(start, end, brk)
         overlaps = self._overlaps(entry.user_id, day, start, end, ignore_id=entry.id)
         if overlaps:
             raise OverlapError(overlaps)
@@ -160,25 +208,24 @@ class TimesheetService:
         return self.repo.get_entry(entry.id)
 
     def change_project(self, entry_id: int, actor: User, project_id: int) -> Entry:
-        entry = self._editable(entry_id, actor)
+        entry = self.editable(entry_id, actor)
         project = self.repo.get_project(project_id)
         if project is None or not project.active:
-            raise ValidationError("Projekt nicht gefunden oder inaktiv")
+            raise ValidationError("project")
         self.repo.update_entry(entry.id, actor.id, project_id=project_id)
         return self.repo.get_entry(entry.id)
 
-    async def change_activity(self, entry_id: int, actor: User, text: str, source_lang: str) -> Entry:
-        entry = self._editable(entry_id, actor)
-        if not text.strip():
-            raise ValidationError("Tätigkeit fehlt")
-        activity_de = await self.translator.to_german(text, source_lang)
-        self.repo.update_entry(
-            entry.id, actor.id, activity_original=text.strip(), activity_de=activity_de, source_lang=source_lang
-        )
+    def change_activity(self, entry_id: int, actor: User, text: str, source_lang: str) -> Entry:
+        """Setzt den neuen Text; die Übersetzung folgt über translate_entries()."""
+        entry = self.editable(entry_id, actor)
+        text = text.strip()
+        if not text:
+            raise ValidationError("activity")
+        self.repo.update_entry(entry.id, actor.id, activity_original=text, activity_de=None, source_lang=source_lang)
         return self.repo.get_entry(entry.id)
 
     def delete(self, entry_id: int, actor: User) -> Entry:
-        entry = self._editable(entry_id, actor)
+        entry = self.editable(entry_id, actor)
         self.repo.delete_entry(entry.id)
         return entry
 
@@ -194,11 +241,8 @@ class TimesheetService:
             groups[(e.activity_original, e.source_lang)].append(e.id)
         remaining = 0
         for (text, lang), ids in groups.items():
-            result = await self.translator.to_german(text, lang)
-            if result is None:
+            if await self.translate_entries(ids, text, lang) is None:
                 remaining += len(ids)
-            else:
-                self.repo.set_translation(ids, result)
         return remaining
 
 
@@ -251,7 +295,7 @@ def _activity_text(entry: Entry) -> str:
 def build_week_report(repo: Repository, customer_id: int, iso_year: int, iso_week: int) -> WeekReport:
     customer = repo.get_customer(customer_id)
     if customer is None:
-        raise ValidationError("Kunde nicht gefunden")
+        raise ValidationError("not_found", "Kunde nicht gefunden")
     monday, sunday = iso_week_range(iso_year, iso_week)
     entries = repo.list_entries(customer_id=customer_id, date_from=monday, date_to=sunday)
 

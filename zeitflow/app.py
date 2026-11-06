@@ -2,44 +2,57 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import timedelta
 
-from telegram import BotCommand, BotCommandScopeChat, Update
+from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import Application, ContextTypes
 from telegram.request import BaseRequest
 
 from zeitflow.bot import admin, correction, entry, registration, views
 from zeitflow.bot.common import Deps
+from zeitflow.bot.menu import set_default_commands, set_user_commands
 from zeitflow.config import ConfigError, Settings, load_settings
 from zeitflow.db import connect, migrate
-from zeitflow.i18n import COMMAND_DESCRIPTIONS, DEFAULT_LANG, WORKER_COMMANDS, t
+from zeitflow.i18n import DEFAULT_LANG, t
 from zeitflow.mailer import Mailer, SmtpMailer
-from zeitflow.models import Role
-from zeitflow.reporting import WeeklyReporter
+from zeitflow.models import Role, UserStatus
+from zeitflow.reporting import WeeklyReporter, WeeklyRunResult
 from zeitflow.repository import Repository
 from zeitflow.services import TimesheetService
+from zeitflow.timeutil import today
 from zeitflow.translation import Translator, build_translator
 
 LOG = logging.getLogger("zeitflow")
 
-FOREMAN_COMMANDS = [("export", "Stundennachweis als Excel")]
-ADMIN_COMMANDS = [
-    ("mitarbeiter", "Mitarbeiter, Rollen, Freigaben"),
-    ("kunden", "Kunden & Projekte anzeigen"),
-    ("neuerkunde", "Kunde anlegen"),
-    ("neuesprojekt", "Projekt anlegen"),
-    ("projekt", "Projekt ändern/deaktivieren"),
-    ("anfahrt", "Anfahrten je Kunde/KW"),
-    ("versenden", "Stundennachweise jetzt senden"),
-]
+RETRY_DELAY = timedelta(minutes=30)
+MAX_RETRIES = 3
+
+
+class StartupError(RuntimeError):
+    pass
+
+
+def sync_configured_admins(repo: Repository, admin_ids: frozenset[int]) -> None:
+    """Konfigurierte Admin-IDs sind maßgeblich – auch für Nutzer, die schon als Mitarbeiter existieren."""
+    for tg_id in admin_ids:
+        user = repo.get_user_by_telegram_id(tg_id)
+        if user and (user.role is not Role.ADMIN or user.status is not UserStatus.ACTIVE):
+            LOG.info("%s wird laut ZEITFLOW_ADMIN_IDS Admin", user.name)
+            repo.update_user(user.id, role=Role.ADMIN, status=UserStatus.ACTIVE)
 
 
 def build_deps(settings: Settings, translator: Translator | None = None, mailer: Mailer | None = None) -> Deps:
     conn = connect(settings.db_path)
     migrate(conn)
     repo = Repository(conn)
+    sync_configured_admins(repo, settings.admin_telegram_ids)
+    if not settings.admin_telegram_ids and not repo.has_admin():
+        raise StartupError("ZEITFLOW_ADMIN_IDS fehlt und es gibt noch keinen Admin – sonst würde ein Fremder Admin")
     service = TimesheetService(
-        repo, translator or build_translator(settings.anthropic_api_key, settings.translation_model)
+        repo,
+        translator or build_translator(settings.anthropic_api_key, settings.translation_model),
+        today=lambda: today(settings.timezone),
     )
     reporter = WeeklyReporter(
         repo, service, mailer or SmtpMailer(settings.smtp), settings.report_recipient, settings.company_name
@@ -47,13 +60,46 @@ def build_deps(settings: Settings, translator: Translator | None = None, mailer:
     return Deps(settings=settings, repo=repo, service=service, reporter=reporter)
 
 
-async def weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def _notify_admins(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     d: Deps = ctx.application.bot_data["deps"]
+    for a in d.repo.list_admins():
+        try:
+            await ctx.bot.send_message(a.telegram_id, text)
+        except TelegramError:
+            LOG.warning("Admin %s nicht erreichbar", a.name)
+
+
+async def weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Versendet die laufende KW sowie alle früheren KWs mit Nachträgen/Korrekturen oder offenem Fehlversand."""
+    d: Deps = ctx.application.bot_data["deps"]
+    attempt = (ctx.job.data or {}).get("attempt", 0) if ctx.job else 0
     iso = d.today().isocalendar()
-    LOG.info("Wochenversand KW %s/%s startet", iso.week, iso.year)
-    result = await d.reporter.run(iso.year, iso.week)
-    LOG.info(result.summary())
-    await admin.deliver_result(ctx, result, chat_ids=[a.telegram_id for a in d.repo.list_admins()])
+    weeks = sorted({(iso.year, iso.week), *d.repo.weeks_needing_resend()})
+    LOG.info("Wochenversand startet (Versuch %s) für KW %s", attempt + 1, ", ".join(f"{w}/{y}" for y, w in weeks))
+    results: list[WeeklyRunResult] = []
+    try:
+        for year, week in weeks:
+            results.append(await d.reporter.run(year, week))
+    except Exception:  # noqa: BLE001 – Job darf nie still scheitern
+        LOG.exception("Wochenversand abgebrochen")
+        await _notify_admins(ctx, "❌ Wochenversand abgebrochen – Details im Log. Neuer Versuch folgt automatisch.")
+        _schedule_retry(ctx, attempt)
+        return
+
+    admin_chats = [a.telegram_id for a in d.repo.list_admins()]
+    for result in results:
+        LOG.info(result.summary())
+        if result.needs_attention or (result.iso_year, result.iso_week) == (iso.year, iso.week):
+            await admin.deliver_result(ctx, result, chat_ids=admin_chats)
+    if any(r.failed for r in results) and d.settings.report_recipient:
+        _schedule_retry(ctx, attempt)
+
+
+def _schedule_retry(ctx: ContextTypes.DEFAULT_TYPE, attempt: int) -> None:
+    if attempt + 1 >= MAX_RETRIES:
+        LOG.error("Wochenversand: keine weiteren automatischen Versuche – bitte /versenden nutzen")
+        return
+    ctx.job_queue.run_once(weekly_report_job, when=RETRY_DELAY, data={"attempt": attempt + 1}, name="weekly_retry")
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -68,21 +114,11 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def configure_commands(app: Application) -> None:
-    for lang, descriptions in COMMAND_DESCRIPTIONS.items():
-        commands = [BotCommand(c, d) for c, d in zip(WORKER_COMMANDS, descriptions, strict=True)]
-        await app.bot.set_my_commands(commands, language_code=None if lang == DEFAULT_LANG else lang)
+    await set_default_commands(app.bot)
     d: Deps = app.bot_data["deps"]
     for user in d.repo.list_users():
-        if not user.can_enter_for_others:
-            continue
-        base = [BotCommand(c, desc) for c, desc in zip(WORKER_COMMANDS, COMMAND_DESCRIPTIONS[user.lang], strict=True)]
-        extra = FOREMAN_COMMANDS + (ADMIN_COMMANDS if user.role is Role.ADMIN else [])
-        try:
-            await app.bot.set_my_commands(
-                base + [BotCommand(c, desc) for c, desc in extra], scope=BotCommandScopeChat(user.telegram_id)
-            )
-        except TelegramError:
-            LOG.warning("Befehlsmenü für %s nicht gesetzt (Chat unbekannt?)", user.name)
+        if user.can_enter_for_others:
+            await set_user_commands(app.bot, user)
 
 
 def build_application(settings: Settings, deps: Deps | None = None, request: BaseRequest | None = None) -> Application:
@@ -105,15 +141,14 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         settings = load_settings()
-    except ConfigError as exc:
-        LOG.error("Konfigurationsfehler: %s", exc)
-        sys.exit(2)
-    if not settings.bot_token:
-        LOG.error("ZEITFLOW_BOT_TOKEN fehlt")
+        if not settings.bot_token:
+            raise ConfigError("ZEITFLOW_BOT_TOKEN fehlt")
+        app = build_application(settings)
+    except (ConfigError, StartupError) as exc:
+        LOG.error("Start abgebrochen: %s", exc)
         sys.exit(2)
     if not settings.report_recipient:
         LOG.warning("ZEITFLOW_REPORT_EMAIL fehlt – Stundennachweise gehen nur per Telegram an die Admins")
-    app = build_application(settings)
     LOG.info(
         "ZeitFlow gestartet (DB: %s, Versand: Tag %s um %s %s)",
         settings.db_path,
