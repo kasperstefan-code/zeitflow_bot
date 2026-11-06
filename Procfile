@@ -1,1 +1,1 @@
-worker: python zeitflow.py
+worker: python -m zeitflow
