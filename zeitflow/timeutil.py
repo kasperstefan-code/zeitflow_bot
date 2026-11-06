@@ -43,7 +43,7 @@ def parse_date(raw: str, reference: date) -> date | None:
             candidate = date(reference.year, month, day)
         except ValueError:
             return None
-        if candidate > reference:  # "30.12." am 02.01. meint das Vorjahr
+        if (candidate - reference).days > 180:  # "30.12." am 02.01. meint das Vorjahr, "05.01." bleibt Zukunft
             try:
                 candidate = date(reference.year - 1, month, day)
             except ValueError:

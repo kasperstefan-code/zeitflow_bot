@@ -85,3 +85,7 @@ def test_short_date_around_new_year_means_previous_year():
     """Befund 12: am 02.01.2027 meint "30.12." den 30.12.2026."""
     assert parse_date("30.12.", date(2027, 1, 2)) == date(2026, 12, 30)
     assert parse_date("29.2.", date(2025, 1, 2)) is None
+
+
+def test_short_future_date_stays_in_the_future():
+    assert parse_date("05.01.", date(2027, 1, 2)) == date(2027, 1, 5)

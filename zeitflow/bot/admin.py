@@ -16,10 +16,9 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    filters,
 )
 
-from zeitflow.bot.common import background, conversation, current_user, deps, keyboard, reply
+from zeitflow.bot.common import TEXT, background, conversation, current_user, deps, keyboard, notify_user, reply
 from zeitflow.bot.menu import set_user_commands
 from zeitflow.export import render_report
 from zeitflow.i18n import t
@@ -29,7 +28,6 @@ from zeitflow.services import build_week_report
 from zeitflow.timeutil import iso_week_range, parse_week
 
 LOG = logging.getLogger(__name__)
-TEXT = filters.TEXT & ~filters.COMMAND
 ROLE_LABELS = {Role.EMPLOYEE: "👤 Mitarbeiter", Role.FOREMAN: "🦺 Vorarbeiter", Role.ADMIN: "👑 Admin"}
 STATUS_LABELS = {UserStatus.PENDING: "⏳ wartet", UserStatus.ACTIVE: "", UserStatus.INACTIVE: "⛔ gesperrt"}
 EXPIRED = "Sitzung abgelaufen, bitte den Befehl neu starten."
@@ -110,6 +108,12 @@ async def on_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if target is None:
         await reply(update, "Nicht gefunden.")
         return
+    if target.telegram_id in deps(ctx).settings.admin_telegram_ids:
+        await update.callback_query.answer(
+            "Admin laut ZEITFLOW_ADMIN_IDS – Änderung bitte dort vornehmen (sonst beim Neustart zurückgesetzt).",
+            show_alert=True,
+        )
+        return
     if target.id == admin.id:
         await update.callback_query.answer(
             "Eigene Rolle/Status bitte von einem anderen Admin ändern lassen.", show_alert=True
@@ -121,7 +125,7 @@ async def on_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         repo.update_user(target.id, status=UserStatus(value))
         if value == "active" and was_pending:
-            await ctx.bot.send_message(target.telegram_id, t(target.lang, "approved"))
+            await notify_user(ctx, target.telegram_id, t(target.lang, "approved"))
     await set_user_commands(ctx.bot, repo.get_user(target.id))
     await _show_user(update, ctx, target.id)
 
@@ -226,8 +230,11 @@ async def cmd_projekt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_ep_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    ctx.user_data.setdefault("ep", {})["id"] = _callback_ints(update)[0]
-    rows = [[("📋 Bezeichnung", "ef:name"), ("🏷 Kostenstelle", "ef:cost_center")], [("⛔ Deaktivieren", "ef:off")]]
+    pid = _callback_ints(update)[0]
+    rows = [
+        [("📋 Bezeichnung", f"ef:{pid}:name"), ("🏷 Kostenstelle", f"ef:{pid}:cost_center")],
+        [("⛔ Deaktivieren", f"ef:{pid}:off")],
+    ]
     await reply(update, "Was ändern?", keyboard(rows))
     return EP_FIELD
 
@@ -235,19 +242,16 @@ async def on_ep_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_ep_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await current_user(update, ctx, min_role=Role.ADMIN) is None:
         return ConversationHandler.END
-    state = ctx.user_data.get("ep", {})
-    if "id" not in state:
-        await reply(update, EXPIRED)
+    _, raw_id, field = update.callback_query.data.split(":")
+    project = deps(ctx).repo.get_project(int(raw_id))
+    if project is None:
+        await reply(update, "Projekt nicht gefunden.")
         return ConversationHandler.END
-    field = update.callback_query.data.split(":")[1]
     if field == "off":
-        deps(ctx).repo.update_project(state["id"], active=0)
-        ctx.user_data.pop("ep", None)
-        await reply(update, "✅ Projekt deaktiviert. Vorhandene Einträge bleiben erhalten.")
+        deps(ctx).repo.update_project(project.id, active=0)
+        await reply(update, f"✅ Projekt „{project.name}“ deaktiviert. Vorhandene Einträge bleiben erhalten.")
         return ConversationHandler.END
-    if field not in ("name", "cost_center"):
-        return ConversationHandler.END
-    state["field"] = field
+    ctx.user_data["ep"] = {"id": project.id, "field": field}
     await reply(update, "Neuer Wert?")
     return EP_VALUE
 
@@ -355,14 +359,16 @@ async def on_ex_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_ex_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await current_user(update, ctx, min_role=Role.FOREMAN) is None:
+    user = await current_user(update, ctx, min_role=Role.FOREMAN)
+    if user is None:
         return ConversationHandler.END
     year, week, customer_id = _callback_ints(update)
     if deps(ctx).repo.get_customer(customer_id) is None:
         await reply(update, "Kunde nicht gefunden.")
         return ConversationHandler.END
     await reply(update, "⏳ Erstelle Stundennachweis …")
-    background(ctx, _send_export(ctx, update.effective_chat.id, customer_id, year, week))
+    chat_id = update.effective_chat.id
+    background(ctx, _send_export(ctx, chat_id, customer_id, year, week), chat_id, user.lang)
     return ConversationHandler.END
 
 
@@ -411,11 +417,13 @@ async def on_send_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_send_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await current_user(update, ctx, min_role=Role.ADMIN) is None:
+    user = await current_user(update, ctx, min_role=Role.ADMIN)
+    if user is None:
         return ConversationHandler.END
     _, mode, year, week = update.callback_query.data.split(":")
     await reply(update, "⏳ Versand läuft …")
-    background(ctx, _run_send(ctx, update.effective_chat.id, int(year), int(week), mode == "all"))
+    chat_id = update.effective_chat.id
+    background(ctx, _run_send(ctx, chat_id, int(year), int(week), mode == "all"), chat_id, user.lang)
     return ConversationHandler.END
 
 
@@ -450,10 +458,12 @@ def handlers():
         ),
         CommandHandler("kunden", cmd_kunden),
         conversation(
+            "neuerkunde",
             [CommandHandler("neuerkunde", cmd_neuerkunde)],
             {NEW_CUSTOMER: [MessageHandler(TEXT, on_new_customer)]},
         ),
         conversation(
+            "neuesprojekt",
             [CommandHandler("neuesprojekt", cmd_neuesprojekt)],
             {
                 NP_CUSTOMER: [CallbackQueryHandler(on_np_customer, pattern=r"^npc:\d+$")],
@@ -462,14 +472,16 @@ def handlers():
             },
         ),
         conversation(
+            "projekt",
             [CommandHandler("projekt", cmd_projekt)],
             {
                 EP_PICK: [CallbackQueryHandler(on_ep_pick, pattern=r"^ep:\d+$")],
-                EP_FIELD: [CallbackQueryHandler(on_ep_field, pattern=r"^ef:\w+$")],
+                EP_FIELD: [CallbackQueryHandler(on_ep_field, pattern=r"^ef:\d+:(name|cost_center|off)$")],
                 EP_VALUE: [MessageHandler(TEXT, on_ep_value)],
             },
         ),
         conversation(
+            "anfahrt",
             [CommandHandler("anfahrt", cmd_anfahrt)],
             {
                 TR_WEEK: [CallbackQueryHandler(on_tr_week, pattern=r"^tw:\d+:\d+$"), MessageHandler(TEXT, on_tr_week)],
@@ -478,6 +490,7 @@ def handlers():
             },
         ),
         conversation(
+            "export",
             [CommandHandler("export", cmd_export)],
             {
                 EX_WEEK: [CallbackQueryHandler(on_ex_week, pattern=r"^xw:\d+:\d+$"), MessageHandler(TEXT, on_ex_week)],
@@ -485,6 +498,7 @@ def handlers():
             },
         ),
         conversation(
+            "versenden",
             [CommandHandler("versenden", cmd_versenden)],
             {
                 SEND_WEEK: [

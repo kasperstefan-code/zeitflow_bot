@@ -74,3 +74,13 @@ async def test_smtp_errors_become_mail_error(monkeypatch):
     monkeypatch.setattr(smtplib, "SMTP", Broken)
     with pytest.raises(MailError):
         await SmtpMailer(settings()).send("a@example.org", "s", "b", [])
+
+
+async def test_non_ascii_password_becomes_mail_error(monkeypatch):
+    class Unicode(FakeSMTP):
+        def login(self, user, password):
+            password.encode("ascii")
+
+    monkeypatch.setattr(smtplib, "SMTP", Unicode)
+    with pytest.raises(MailError):
+        await SmtpMailer(settings(password="pässwort")).send("a@example.org", "s", "b", [])

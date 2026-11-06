@@ -11,10 +11,9 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    filters,
 )
 
-from zeitflow.bot.common import conversation, current_user, deps, keyboard, reply
+from zeitflow.bot.common import TEXT, conversation, current_user, deps, keyboard, notify_user, reply, telegram_label
 from zeitflow.i18n import DEFAULT_LANG, LANGUAGES, t
 from zeitflow.models import Role, UserStatus
 
@@ -86,7 +85,9 @@ async def reg_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await ctx.bot.send_message(
                 admin.telegram_id,
-                f"🆕 Neue Anmeldung: {name} ({LANGUAGES.get(lang, lang)})",
+                f"🆕 Neue Anmeldung: {name} ({LANGUAGES.get(lang, lang)})\n"
+                f"Telegram: {telegram_label(update.effective_user)}\n"
+                "Bitte prüfen, ob das wirklich diese Person ist.",
                 reply_markup=markup,
             )
         except Exception:  # noqa: BLE001 – ein nicht erreichbarer Admin darf die Anmeldung nicht blockieren
@@ -110,7 +111,7 @@ async def approval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     approved = action == "ap"
     d.repo.update_user(target.id, status=UserStatus.ACTIVE if approved else UserStatus.INACTIVE)
     await reply(update, f"{'✅ Freigegeben' if approved else '❌ Abgelehnt'}: {target.name}")
-    await ctx.bot.send_message(target.telegram_id, t(target.lang, "approved" if approved else "rejected"))
+    await notify_user(ctx, target.telegram_id, t(target.lang, "approved" if approved else "rejected"))
 
 
 async def cmd_sprache(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -137,11 +138,12 @@ async def cmd_hilfe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def handlers():
     registration = conversation(
+        "start",
         [CommandHandler("start", cmd_start)],
         {
             REG_NAME: [
                 CallbackQueryHandler(reg_lang, pattern=r"^rl:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name),
+                MessageHandler(TEXT, reg_name),
             ]
         },
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from zeitflow.export import RenderedFile, render_report
 from zeitflow.mailer import Mailer, MailError
@@ -13,6 +14,10 @@ from zeitflow.services import TimesheetService, WeekReport, build_week_report
 from zeitflow.timeutil import iso_week_range
 
 LOG = logging.getLogger(__name__)
+
+# Wie weit zurück der Sonntagslauf nie versendete Wochen und offene Übersetzungen sucht (≥ Korrekturfenster Büro).
+LOOKBACK_DAYS = 70
+TRANSLATION_BUDGET_SECONDS = 180
 
 
 @dataclass
@@ -60,14 +65,39 @@ class WeeklyReporter:
         self.company = company
         self._lock = asyncio.Lock()
 
+    def pending_weeks(self) -> list[tuple[int, int]]:
+        """Alle KWs, die der Sonntagslauf bearbeiten muss.
+
+        Laufende KW; bereits versendete KWs mit späteren Änderungen oder Fehlversand; vergangene KWs mit
+        Einträgen, die nie versendet wurden (z. B. am Sonntag noch leer, Nachtrag kam später); KWs mit noch
+        offenen Übersetzungen (eine gelungene Übersetzung löst dann den Korrekturversand aus).
+        """
+        today = self.service.today()
+        current = tuple(today.isocalendar())[:2]
+        since = today - timedelta(days=LOOKBACK_DAYS)
+        weeks = {current, *self.repo.weeks_needing_resend()}
+        for customer_id, year, week in self.repo.unsent_changed_weeks():
+            monday, sunday = iso_week_range(year, week)
+            if (
+                (year, week) < current
+                and sunday >= since
+                and self.repo.list_entries(customer_id=customer_id, date_from=monday, date_to=sunday, limit=1)
+            ):
+                weeks.add((year, week))
+        for e in self.repo.list_entries(date_from=since, untranslated_only=True):
+            weeks.add(tuple(e.work_date.isocalendar())[:2])
+        return sorted(weeks)
+
     async def run(self, iso_year: int, iso_week: int, *, force: bool = False) -> WeeklyRunResult:
+        monday, sunday = iso_week_range(iso_year, iso_week)
+        # Außerhalb der Sperre und mit Zeitlimit: eine langsame Claude API blockiert weder /versenden noch den Versand.
+        await self.service.translate_pending(monday, sunday, max_seconds=TRANSLATION_BUDGET_SECONDS)
         # Sonntagsjob und /versenden können gleichzeitig laufen – ohne Sperre ginge eine Woche doppelt raus.
         async with self._lock:
             return await self._run(iso_year, iso_week, force)
 
     async def _run(self, iso_year: int, iso_week: int, force: bool) -> WeeklyRunResult:
         monday, sunday = iso_week_range(iso_year, iso_week)
-        await self.service.translate_pending(monday, sunday)
         result = WeeklyRunResult(iso_year, iso_week)
         candidates = {c.id: c for c in self.repo.customers_with_entries(monday, sunday)}
         candidates.update({c.id: c for c in self.repo.customers_sent_for_week(iso_year, iso_week)})
@@ -85,20 +115,24 @@ class WeeklyReporter:
         self, customer_id: int, name: str, iso_year: int, iso_week: int, correction: bool
     ) -> CustomerResult:
         snapshot = utc_stamp()  # Änderungen ab hier lösen den nächsten Korrekturversand aus
-        report = build_week_report(self.repo, customer_id, iso_year, iso_week)
-        file = render_report(report)
-        label = "Korrektur" if correction else ""
-        if not self.recipient:
-            return CustomerResult(name, "failed", "ZEITFLOW_REPORT_EMAIL fehlt", file)
-        subject = f"Stundennachweis {name} – KW {iso_week:02d}/{iso_year}" + (" (korrigiert)" if correction else "")
+        file = None
         try:
+            report = build_week_report(self.repo, customer_id, iso_year, iso_week)
+            file = render_report(report)
+            if not self.recipient:
+                return CustomerResult(name, "failed", "ZEITFLOW_REPORT_EMAIL fehlt", file)
+            subject = f"Stundennachweis {name} – KW {iso_week:02d}/{iso_year}" + (" (korrigiert)" if correction else "")
             await self.mailer.send(
                 self.recipient, subject=subject, body=self._body(report, correction), attachments=[file]
             )
-        except MailError as exc:
-            LOG.error("Versand an %s für %s fehlgeschlagen: %s", self.recipient, name, exc)
+        except Exception as exc:  # noqa: BLE001 – ein Kunde darf den Versand der anderen nie verhindern
+            if isinstance(exc, MailError):
+                LOG.error("Versand an %s für %s fehlgeschlagen: %s", self.recipient, name, exc)
+            else:
+                LOG.exception("Stundennachweis für %s KW %s/%s fehlgeschlagen", name, iso_week, iso_year)
             self.repo.log_report_run(customer_id, iso_year, iso_week, self.recipient, "failed", str(exc), snapshot)
-            return CustomerResult(name, "failed", str(exc), file)
+            return CustomerResult(name, "failed", str(exc) or type(exc).__name__, file)
+        label = "Korrektur" if correction else ""
         self.repo.log_report_run(customer_id, iso_year, iso_week, self.recipient, "sent", None, snapshot)
         hints = [label] if label else []
         if report.untranslated:

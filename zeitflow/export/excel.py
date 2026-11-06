@@ -13,6 +13,7 @@ import math
 from datetime import time
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
@@ -52,7 +53,12 @@ def _minutes_as_time(minutes: int) -> time:
 
 
 def _text(ws: Worksheet, row: int, col: int, value: str):
-    """Freitext immer als Text speichern – sonst wird z. B. "=..." als Formel ausgeführt."""
+    """Freitext immer als Text speichern – sonst wird z. B. "=..." als Formel ausgeführt.
+
+    Steuerzeichen (aus Telegram kopierte Texte) sind in XLSX unzulässig und würden den ganzen Export abbrechen.
+    """
+    if isinstance(value, str):
+        value = ILLEGAL_CHARACTERS_RE.sub("", value)
     cell = ws.cell(row, col, value)
     if isinstance(value, str):
         cell.data_type = "s"

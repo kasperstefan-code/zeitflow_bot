@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -138,9 +139,11 @@ class TimesheetService:
         except Exception:  # noqa: BLE001 – Übersetzung ist nachholbar, darf nie eine Erfassung stören
             LOG.exception("Übersetzung fehlgeschlagen")
             return None
-        if result is not None:
-            self.repo.set_translation(entry_ids, activity, result)
-        return result
+        if result is None:
+            return None
+        updated = self.repo.set_translation(entry_ids, activity, result)
+        # Text wurde inzwischen geändert → veraltete Übersetzung weder speichern noch melden.
+        return result if updated else None
 
     def _overlaps(self, user_id: int, day: date, start: str, end: str, ignore_id: int | None = None) -> list[Overlap]:
         return [
@@ -231,8 +234,14 @@ class TimesheetService:
 
     # --- Übersetzungen nachholen --------------------------------------------------
 
-    async def translate_pending(self, date_from: date, date_to: date, customer_id: int | None = None) -> int:
-        """Übersetzt noch offene Tätigkeiten; gleiche Texte nur einmal. Gibt Anzahl offener Einträge danach zurück."""
+    async def translate_pending(
+        self, date_from: date, date_to: date, customer_id: int | None = None, max_seconds: float | None = None
+    ) -> int:
+        """Übersetzt noch offene Tätigkeiten; gleiche Texte nur einmal. Gibt Anzahl offener Einträge danach zurück.
+
+        max_seconds begrenzt die Gesamtdauer – bei API-Ausfall wird der Rest beim nächsten Lauf nachgeholt.
+        """
+        deadline = time.monotonic() + max_seconds if max_seconds is not None else None
         pending = self.repo.list_entries(
             customer_id=customer_id, date_from=date_from, date_to=date_to, untranslated_only=True
         )
@@ -241,6 +250,9 @@ class TimesheetService:
             groups[(e.activity_original, e.source_lang)].append(e.id)
         remaining = 0
         for (text, lang), ids in groups.items():
+            if deadline is not None and time.monotonic() > deadline:
+                remaining += len(ids)
+                continue
             if await self.translate_entries(ids, text, lang) is None:
                 remaining += len(ids)
         return remaining

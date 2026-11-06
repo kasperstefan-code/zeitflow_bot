@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import date
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import BaseHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.error import TelegramError
+from telegram.ext import BaseHandler, CommandHandler, ContextTypes, ConversationHandler, filters
 
 from zeitflow.config import Settings
 from zeitflow.i18n import DEFAULT_LANG, t
@@ -14,6 +16,8 @@ from zeitflow.reporting import WeeklyReporter
 from zeitflow.repository import Repository
 from zeitflow.services import Overlap, TimesheetService, ValidationError
 from zeitflow.timeutil import short_name, today
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -66,39 +70,101 @@ async def current_user(
     return user
 
 
+ACTIVE_DIALOG = "active_dialog"
+# Zustandsschlüssel der Dialoge in user_data – /cancel räumt alle weg.
+DIALOG_STATE_KEYS = ("reg_lang", "draft", "corr", "np", "ep", "anfahrt")
+
+# Nur echte neue Textnachrichten – bearbeitete Nachrichten haben kein update.message.
+TEXT = filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND
+
+
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = deps(ctx).repo.get_user_by_telegram_id(update.effective_user.id)
-    ctx.user_data.clear()
+    for key in (ACTIVE_DIALOG, *DIALOG_STATE_KEYS):
+        ctx.user_data.pop(key, None)
     await reply(update, t(user.lang if user else DEFAULT_LANG, "cancelled"))
     return ConversationHandler.END
 
 
-async def end_and_redispatch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ein anderer Befehl während eines offenen Dialogs: Dialog beenden und den Befehl normal ausführen.
+class Dialog(ConversationHandler):
+    """ConversationHandler, von dem pro Nutzer immer nur der zuletzt gestartete Dialog Eingaben annimmt.
 
-    Ohne das bliebe der alte Dialog bis zum Timeout aktiv und würde Texteingaben des neuen Dialogs abfangen.
-    Die Neuzustellung läuft als Task, weil der Dialogstatus erst nach Rückkehr dieses Callbacks auf END steht.
+    Alle Dialoge liegen in einer Handler-Gruppe; PTB nimmt den ersten passenden. Ohne diese Sperre würde ein
+    vergessener, früher registrierter Dialog Texte und Buttons eines später gestarteten Dialogs abfangen
+    (bis zu seinem Timeout). Ein Einstiegsbefehl macht seinen Dialog aktiv, alle anderen ruhen danach.
     """
-    ctx.user_data.clear()
-    ctx.application.create_task(ctx.application.process_update(update), update=update)
-    return ConversationHandler.END
+
+    def __init__(self, name: str, entry_points, states, timeout: int):
+        super().__init__(
+            entry_points=entry_points,
+            states=states,
+            fallbacks=[CommandHandler("cancel", cancel)],
+            conversation_timeout=timeout,
+            allow_reentry=True,
+            name=name,
+        )
+        self.application = None
+
+    def check_update(self, update: object):
+        result = super().check_update(update)
+        if result is None or result[2] in self.entry_points or self.application is None:
+            return result
+        user_data = self.application.user_data.get(update.effective_user.id, {})
+        return result if user_data.get(ACTIVE_DIALOG) == self.name else None
+
+    async def handle_update(self, update, application, check_result, context):
+        if check_result[2] in self.entry_points:
+            context.user_data[ACTIVE_DIALOG] = self.name
+        return await super().handle_update(update, application, check_result, context)
 
 
-def conversation(
-    entry_points: list[BaseHandler], states: dict[object, list[BaseHandler]], timeout: int = 900
-) -> ConversationHandler:
-    return ConversationHandler(
-        entry_points=entry_points,
-        states=states,
-        fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.COMMAND, end_and_redispatch)],
-        conversation_timeout=timeout,
-        allow_reentry=True,
-    )
+def conversation(name: str, entry_points: list[BaseHandler], states: dict, timeout: int = 900) -> Dialog:
+    return Dialog(name, entry_points, states, timeout)
 
 
-def background(ctx: ContextTypes.DEFAULT_TYPE, coro: Coroutine) -> None:
-    """Langsame Arbeit (Claude API, Export, SMTP) ohne andere Nutzer zu blockieren; Fehler gehen an on_error."""
-    ctx.application.create_task(coro)
+def bind_dialogs(application) -> None:
+    for group in application.handlers.values():
+        for handler in group:
+            if isinstance(handler, Dialog):
+                handler.application = application
+
+
+def background(ctx: ContextTypes.DEFAULT_TYPE, coro: Coroutine, chat_id: int | None = None, lang: str = DEFAULT_LANG):
+    """Langsame Arbeit (Claude API, Export, SMTP) ohne andere Nutzer zu blockieren.
+
+    Fehler werden geloggt und – wenn ein Chat bekannt ist – dem Nutzer gemeldet, statt ihn bei "⏳" stehen zu lassen.
+    """
+
+    async def guarded():
+        try:
+            await coro
+        except Exception:  # noqa: BLE001 – Hintergrundaufgabe darf nicht still scheitern
+            LOG.exception("Hintergrundaufgabe fehlgeschlagen")
+            if chat_id is not None:
+                try:
+                    await ctx.bot.send_message(chat_id, t(lang, "error"))
+                except TelegramError:
+                    pass
+
+    ctx.application.create_task(guarded())
+
+
+async def notify_user(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> bool:
+    """Benachrichtigung, die eine bereits gespeicherte Änderung nicht scheitern lässt (z. B. Bot blockiert)."""
+    try:
+        await ctx.bot.send_message(chat_id, text)
+        return True
+    except TelegramError:
+        LOG.warning("Nutzer %s nicht erreichbar", chat_id)
+        return False
+
+
+def telegram_label(tg_user) -> str:
+    parts = [tg_user.full_name]
+    if tg_user.username:
+        parts.append(f"@{tg_user.username}")
+    parts.append(f"ID {tg_user.id}")
+    return " · ".join(parts)
 
 
 def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:

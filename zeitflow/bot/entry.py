@@ -11,10 +11,10 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    filters,
 )
 
 from zeitflow.bot.common import (
+    TEXT,
     background,
     chunk,
     conversation,
@@ -29,7 +29,14 @@ from zeitflow.bot.common import (
 )
 from zeitflow.i18n import t
 from zeitflow.models import User
-from zeitflow.services import EDIT_WINDOW_DAYS, MAX_PAST_DAYS, EntryDraft, OverlapError, ValidationError
+from zeitflow.services import (
+    EDIT_WINDOW_DAYS,
+    MAX_PAST_DAYS,
+    EntryDraft,
+    OverlapError,
+    PermissionDenied,
+    ValidationError,
+)
 from zeitflow.timeutil import parse_date, parse_time, short_name, to_minutes, work_minutes
 
 (WORKERS, CUSTOMER, PROJECT, DATE, START, END, BREAK, ACTIVITY, CONFIRM, MORE) = range(10)
@@ -269,7 +276,10 @@ async def on_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         hours=fmt_hours(work_minutes(draft["start"], draft["end"], draft["break"])),
         activity=draft["activity"],
     )
-    markup = keyboard([[(t(user.lang, "save"), "ok"), (t(user.lang, "cancel"), "x")]])
+    # Nonce: ein alter Speichern-Button aus einer früheren Zusammenfassung speichert nicht den neuen Entwurf.
+    draft["nonce"] = draft.get("nonce", 0) + 1
+    nonce = draft["nonce"]
+    markup = keyboard([[(t(user.lang, "save"), f"ok:{nonce}"), (t(user.lang, "cancel"), f"x:{nonce}")]])
     await update.message.reply_text(f"{summary}\n\n{t(user.lang, 'confirm')}", reply_markup=markup)
     return CONFIRM
 
@@ -278,8 +288,11 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = await current_user(update, ctx)
     if user is None:
         return ConversationHandler.END
-    if update.callback_query.data == "x":
-        ctx.user_data.clear()
+    action, nonce = update.callback_query.data.split(":")
+    if int(nonce) != _draft(ctx).get("nonce"):
+        return await _expired(update, user)
+    if action == "x":
+        ctx.user_data.pop("draft", None)
         await reply(update, t(user.lang, "cancelled"))
         return ConversationHandler.END
     draft = _draft(ctx)
@@ -301,11 +314,15 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         result = service.record(entry, user)
     except OverlapError as exc:
         await update.callback_query.edit_message_text(t(user.lang, "overlap", list=overlap_lines(exc.overlaps)))
-        ctx.user_data.clear()
+        ctx.user_data.pop("draft", None)
         return ConversationHandler.END
     except ValidationError as exc:
         await update.callback_query.edit_message_text(error_text(user.lang, exc))
-        ctx.user_data.clear()
+        ctx.user_data.pop("draft", None)
+        return ConversationHandler.END
+    except PermissionDenied:
+        await update.callback_query.edit_message_text(t(user.lang, "no_permission"))
+        ctx.user_data.pop("draft", None)
         return ConversationHandler.END
 
     background(ctx, _translate_and_report(ctx, update.effective_chat.id, user, result.entry_ids, result.activity))
@@ -333,18 +350,19 @@ async def on_more(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     if update.callback_query.data == "m:y" and _draft(ctx).get("workers"):
         return await _ask_customer(update, ctx, user)
-    ctx.user_data.clear()
+    ctx.user_data.pop("draft", None)
     await reply(update, t(user.lang, "done"))
     return ConversationHandler.END
 
 
 def handlers():
-    text = filters.TEXT & ~filters.COMMAND
+    text = TEXT
     return [
         conversation(
+            "zeit",
             [CommandHandler("zeit", cmd_zeit)],
             {
-                WORKERS: [CallbackQueryHandler(on_worker, pattern=r"^w:")],
+                WORKERS: [CallbackQueryHandler(on_worker, pattern=r"^w:(\d+|next)$")],
                 CUSTOMER: [CallbackQueryHandler(on_customer, pattern=r"^c:\d+$")],
                 PROJECT: [CallbackQueryHandler(on_project, pattern=r"^p:\d+$")],
                 DATE: [CallbackQueryHandler(on_date, pattern=r"^d:"), MessageHandler(text, on_date)],
@@ -352,7 +370,7 @@ def handlers():
                 END: [CallbackQueryHandler(on_end, pattern=r"^t:"), MessageHandler(text, on_end)],
                 BREAK: [CallbackQueryHandler(on_break, pattern=r"^b:\d+$"), MessageHandler(text, on_break)],
                 ACTIVITY: [MessageHandler(text, on_activity)],
-                CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^(ok|x)$")],
+                CONFIRM: [CallbackQueryHandler(on_confirm, pattern=r"^(ok|x):\d+$")],
                 MORE: [CallbackQueryHandler(on_more, pattern=r"^m:[yn]$")],
             },
             timeout=1800,

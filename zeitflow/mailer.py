@@ -47,7 +47,7 @@ class SmtpMailer:
                 if s.user:
                     smtp.login(s.user, s.password)
                 smtp.send_message(msg)
-        except (smtplib.SMTPException, OSError) as exc:
+        except (smtplib.SMTPException, OSError, UnicodeError, ValueError) as exc:
             raise MailError(f"E-Mail-Versand fehlgeschlagen: {exc}") from exc
 
     async def send(self, recipient: str, subject: str, body: str, attachments: list[RenderedFile]) -> None:

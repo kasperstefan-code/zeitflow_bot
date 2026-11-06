@@ -232,3 +232,9 @@ async def test_week_report_marks_untranslated(repo, world):
     report = build_week_report(repo, world["smf"].id, 2026, 13)
     assert report.untranslated == 1
     assert report.days[1].rows[0].activity == UNTRANSLATED_PREFIX + "Монтаж трубопровода"
+
+
+async def test_stale_translation_is_not_reported_back(service, world):
+    entry_id = service.record(draft([world["w2"].id], world["p1"].id, lang="pl"), world["w2"]).entry_ids[0]
+    service.change_activity(entry_id, world["w2"], "Izolacja rur", "pl")
+    assert await service.translate_entries([entry_id], "Монтаж трубопровода", "ru") is None

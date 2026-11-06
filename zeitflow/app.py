@@ -6,11 +6,11 @@ from datetime import timedelta
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import BaseRequest
 
 from zeitflow.bot import admin, correction, entry, registration, views
-from zeitflow.bot.common import Deps
+from zeitflow.bot.common import Deps, bind_dialogs, cancel
 from zeitflow.bot.menu import set_default_commands, set_user_commands
 from zeitflow.config import ConfigError, Settings, load_settings
 from zeitflow.db import connect, migrate
@@ -70,36 +70,48 @@ async def _notify_admins(ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
 
 
 async def weekly_report_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Versendet die laufende KW sowie alle früheren KWs mit Nachträgen/Korrekturen oder offenem Fehlversand."""
-    d: Deps = ctx.application.bot_data["deps"]
-    attempt = (ctx.job.data or {}).get("attempt", 0) if ctx.job else 0
-    iso = d.today().isocalendar()
-    weeks = sorted({(iso.year, iso.week), *d.repo.weeks_needing_resend()})
-    LOG.info("Wochenversand startet (Versuch %s) für KW %s", attempt + 1, ", ".join(f"{w}/{y}" for y, w in weeks))
-    results: list[WeeklyRunResult] = []
+    """Sonntagslauf: laufende KW plus alles, was Reporter.pending_weeks() als offen meldet.
+
+    Wiederholungen übernehmen die KWs des ursprünglichen Laufs – auch wenn sie nach Mitternacht laufen.
+    """
+    data = (ctx.job.data if ctx.job else None) or {}
+    attempt = data.get("attempt", 0)
     try:
+        d: Deps = ctx.application.bot_data["deps"]
+        weeks = sorted({*map(tuple, data.get("weeks", [])), *d.reporter.pending_weeks()})
+        LOG.info("Wochenversand (Versuch %s) für KW %s", attempt + 1, ", ".join(f"{w}/{y}" for y, w in weeks))
+        current = tuple(d.today().isocalendar())[:2]
+        results: list[WeeklyRunResult] = []
         for year, week in weeks:
             results.append(await d.reporter.run(year, week))
+        admin_chats = [a.telegram_id for a in d.repo.list_admins()]
+        for result in results:
+            LOG.info(result.summary())
+            if result.needs_attention or (result.iso_year, result.iso_week) == current:
+                await admin.deliver_result(ctx, result, chat_ids=admin_chats)
+        failed_weeks = [(r.iso_year, r.iso_week) for r in results if r.failed]
+        if failed_weeks and d.settings.report_recipient:
+            await _retry_or_give_up(ctx, attempt, failed_weeks)
     except Exception:  # noqa: BLE001 – Job darf nie still scheitern
         LOG.exception("Wochenversand abgebrochen")
-        await _notify_admins(ctx, "❌ Wochenversand abgebrochen – Details im Log. Neuer Versuch folgt automatisch.")
-        _schedule_retry(ctx, attempt)
+        await _retry_or_give_up(ctx, attempt, data.get("weeks", []), crashed=True)
+
+
+async def _retry_or_give_up(ctx, attempt: int, weeks: list, crashed: bool = False) -> None:
+    final = attempt + 1 >= MAX_RETRIES
+    prefix = "❌ Wochenversand abgebrochen – Details im Log." if crashed else "⚠️ Nicht alle Stundennachweise versendet."
+    if final:
+        LOG.error("Wochenversand: keine weiteren automatischen Versuche")
+        await _notify_admins(ctx, f"{prefix} Keine weiteren automatischen Versuche – bitte /versenden nutzen.")
         return
-
-    admin_chats = [a.telegram_id for a in d.repo.list_admins()]
-    for result in results:
-        LOG.info(result.summary())
-        if result.needs_attention or (result.iso_year, result.iso_week) == (iso.year, iso.week):
-            await admin.deliver_result(ctx, result, chat_ids=admin_chats)
-    if any(r.failed for r in results) and d.settings.report_recipient:
-        _schedule_retry(ctx, attempt)
-
-
-def _schedule_retry(ctx: ContextTypes.DEFAULT_TYPE, attempt: int) -> None:
-    if attempt + 1 >= MAX_RETRIES:
-        LOG.error("Wochenversand: keine weiteren automatischen Versuche – bitte /versenden nutzen")
-        return
-    ctx.job_queue.run_once(weekly_report_job, when=RETRY_DELAY, data={"attempt": attempt + 1}, name="weekly_retry")
+    if crashed:
+        await _notify_admins(ctx, f"{prefix} Neuer Versuch in {int(RETRY_DELAY.total_seconds() // 60)} Minuten.")
+    ctx.job_queue.run_once(
+        weekly_report_job,
+        when=RETRY_DELAY,
+        data={"attempt": attempt + 1, "weeks": [list(w) for w in weeks]},
+        name="weekly_retry",
+    )
 
 
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,6 +142,8 @@ def build_application(settings: Settings, deps: Deps | None = None, request: Bas
     for module in (registration, entry, views, correction, admin):
         for handler in module.handlers():
             app.add_handler(handler)
+    app.add_handler(CommandHandler("cancel", cancel))  # /cancel ohne offenen Dialog
+    bind_dialogs(app)
     app.add_error_handler(on_error)
     report_time = settings.report_time.replace(tzinfo=settings.timezone)
     app.job_queue.run_daily(weekly_report_job, time=report_time, days=(settings.report_weekday,), name="weekly_report")

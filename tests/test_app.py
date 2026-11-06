@@ -126,12 +126,62 @@ async def test_weekly_job_retries_failed_mail_and_gives_up(tmp_path):
     deps.service.record(draft([admin.id], project.id, day=date(2026, 3, 24)), admin)
     ctx = job_ctx(deps)
     await weekly_report_job(ctx)
-    assert ctx.job_queue.scheduled[0][1] == {"attempt": 1}
+    assert ctx.job_queue.scheduled[0][1] == {"attempt": 1, "weeks": [[2026, 13]]}
     assert ctx.bot.documents, "nicht versendete Datei geht an die Admins"
 
     last = job_ctx(deps, attempt=MAX_RETRIES - 1)
     await weekly_report_job(last)
     assert last.job_queue.scheduled == []
+    assert any("Keine weiteren automatischen Versuche" in text for _, text in last.bot.messages)
+
+
+async def test_retry_after_midnight_keeps_the_original_week(tmp_path):
+    """Retry läuft Montag 00:30 – die KW des Sonntagslaufs darf nicht verloren gehen."""
+    mailer = FakeMailer(fail=True)
+    deps, admin, project = job_deps(tmp_path, mailer, date(2026, 3, 29))
+    deps.service.record(draft([admin.id], project.id, day=date(2026, 3, 24)), admin)
+    first = job_ctx(deps)
+    await weekly_report_job(first)
+    retry_data = first.job_queue.scheduled[0][1]
+
+    mailer.fail = False
+    deps.today = deps.service.today = lambda: date(2026, 3, 30)
+    retry = job_ctx(deps)
+    retry.job = SimpleNamespace(data=retry_data)
+    await weekly_report_job(retry)
+    assert [m["subject"] for m in mailer.sent] == ["Stundennachweis Kunde A – KW 13/2026"]
+
+
+async def test_week_empty_on_sunday_is_sent_when_entries_arrive_later(tmp_path):
+    """Runde 2: KW war am Sonntag leer (oder Kunde fehlte) – Nachtrag wird beim nächsten Lauf erstmals versendet."""
+    mailer = FakeMailer()
+    deps, admin, project = job_deps(tmp_path, mailer, date(2026, 3, 29))
+    await weekly_report_job(job_ctx(deps))
+    assert mailer.sent == []
+
+    deps.today = deps.service.today = lambda: date(2026, 4, 1)
+    deps.service.record(draft([admin.id], project.id, day=date(2026, 3, 27)), admin)
+    deps.today = deps.service.today = lambda: date(2026, 4, 5)
+    await weekly_report_job(job_ctx(deps))
+    assert [m["subject"] for m in mailer.sent] == ["Stundennachweis Kunde A – KW 13/2026"]
+
+
+async def test_failed_translation_in_sent_week_is_retried_and_resent(tmp_path):
+    translator = FakeTranslator(fail=True)
+    mailer = FakeMailer()
+    deps = build_deps(settings_for(tmp_path, ZEITFLOW_REPORT_EMAIL="a@example.org"), translator, mailer)
+    deps.today = deps.service.today = lambda: date(2026, 3, 29)
+    admin = deps.repo.create_user(1, "Anna Büro", "de", Role.ADMIN, UserStatus.ACTIVE)
+    project = deps.repo.create_project(deps.repo.create_customer("Kunde A").id, "Projekt", "1")
+    deps.service.record(draft([admin.id], project.id, day=date(2026, 3, 24), lang="ru"), admin)
+    await weekly_report_job(job_ctx(deps))
+    assert "nicht übersetzt" in mailer.sent[-1]["body"]
+
+    translator.fail = False
+    deps.today = deps.service.today = lambda: date(2026, 4, 5)
+    await weekly_report_job(job_ctx(deps))
+    assert mailer.sent[-1]["subject"] == "Stundennachweis Kunde A – KW 13/2026 (korrigiert)"
+    assert "nicht übersetzt" not in mailer.sent[-1]["body"]
 
 
 async def test_weekly_job_crash_notifies_admins_and_retries(tmp_path, monkeypatch):

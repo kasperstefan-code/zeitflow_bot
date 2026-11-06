@@ -391,6 +391,20 @@ class Repository:
         ).fetchall()
         return [(r[0], r[1]) for r in rows]
 
+    def unsent_changed_weeks(self) -> list[tuple[int, int, int]]:
+        """(Kunde, Jahr, KW) mit Aktivität, für die noch nie erfolgreich versendet wurde."""
+        rows = self.conn.execute(
+            """
+            SELECT w.customer_id, w.iso_year, w.iso_week FROM week_changes w
+            WHERE NOT EXISTS (
+                SELECT 1 FROM report_runs r WHERE r.customer_id=w.customer_id AND r.iso_year=w.iso_year
+                AND r.iso_week=w.iso_week AND r.status='sent'
+            )
+            ORDER BY 2, 3, 1
+            """
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
     def customers_sent_for_week(self, iso_year: int, iso_week: int) -> list[Customer]:
         rows = self.conn.execute(
             """

@@ -115,3 +115,10 @@ def test_hours_are_exact_not_rounded():
     _, ws = load(make_report({1: rows}))
     tue = find_row(ws, 1, "Di.")
     assert sum(ws.cell(tue + i, 8).value for i in range(3)) == pytest.approx(1.0)
+
+
+def test_control_characters_do_not_break_export():
+    row = ReportRow("A\x00B", "Rohr\x07leitung\x1b montiert", "1\x0b2", "06:30", 0, "07:30", 60)
+    _, ws = load(make_report({1: [row]}))
+    tue = find_row(ws, 1, "Di.")
+    assert (ws.cell(tue, 2).value, ws.cell(tue, 3).value, ws.cell(tue, 4).value) == ("AB", "Rohrleitung montiert", "12")

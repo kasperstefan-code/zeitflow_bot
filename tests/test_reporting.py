@@ -130,3 +130,22 @@ async def test_empty_week(repo, world):
     result = await reporter.run(2026, 20)
     assert result.results == []
     assert "nichts versendet" in result.summary()
+
+
+async def test_unexpected_error_for_one_customer_does_not_stop_the_others(repo, world):
+    class Flaky(FakeMailer):
+        async def send(self, recipient, subject, body, attachments):
+            if "Rothaus" in subject:
+                raise RuntimeError("unerwartet")
+            await super().send(recipient, subject, body, attachments)
+
+    mailer = Flaky()
+    result = await WeeklyReporter(repo, seed(repo, world), mailer, "a@example.org").run(2026, 13)
+    status = {r.customer_name: r.status for r in result.results}
+    assert status == {"Brauerei Rothaus": "failed", "Schwarzwaldmilch GmbH Freiburg": "sent"}
+    assert repo.weeks_needing_resend() == [(2026, 13)], "Fehlversand ist protokolliert und wird wiederholt"
+
+
+async def test_translation_budget_is_respected(repo, world):
+    service = seed(repo, world, FakeTranslator(fail=True))
+    assert await service.translate_pending(date(2026, 3, 23), date(2026, 3, 29), max_seconds=0) == 2
