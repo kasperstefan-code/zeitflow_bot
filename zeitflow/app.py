@@ -15,7 +15,7 @@ from zeitflow.bot.menu import set_default_commands, set_user_commands
 from zeitflow.config import ConfigError, Settings, load_settings
 from zeitflow.db import connect, migrate
 from zeitflow.i18n import DEFAULT_LANG, t
-from zeitflow.mailer import Mailer, SmtpMailer
+from zeitflow.mailer import Mailer, build_mailer
 from zeitflow.models import Role, UserStatus
 from zeitflow.reporting import TRANSLATION_BUDGET_SECONDS, WeeklyReporter, WeeklyRunResult
 from zeitflow.repository import Repository
@@ -55,7 +55,7 @@ def build_deps(settings: Settings, translator: Translator | None = None, mailer:
         today=lambda: today(settings.timezone),
     )
     reporter = WeeklyReporter(
-        repo, service, mailer or SmtpMailer(settings.smtp), settings.report_recipient, settings.company_name
+        repo, service, mailer or build_mailer(settings), settings.report_recipient, settings.company_name
     )
     return Deps(settings=settings, repo=repo, service=service, reporter=reporter)
 
@@ -172,8 +172,9 @@ def main() -> None:
     if not settings.report_recipient:
         LOG.warning("ZEITFLOW_REPORT_EMAIL fehlt – Stundennachweise gehen nur per Telegram an die Admins")
     LOG.info(
-        "ZeitFlow gestartet (DB: %s, Versand: Tag %s um %s %s)",
+        "ZeitFlow gestartet (DB: %s, Mail: %s, Versand: Tag %s um %s %s)",
         settings.db_path,
+        settings.mail.provider,
         settings.report_weekday,
         settings.report_time,
         settings.timezone,

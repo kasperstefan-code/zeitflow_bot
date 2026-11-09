@@ -85,6 +85,29 @@ ZEITFLOW_BOT_TOKEN, ZEITFLOW_ADMIN_IDS, ZEITFLOW_DB_PATH=/data/zeitflow.db,
 ANTHROPIC_API_KEY, ZEITFLOW_REPORT_EMAIL, ZEITFLOW_SMTP_HOST/USER/PASSWORD/FROM
 ```
 
+### Mailversand über Brevo (nötig auf Railway Hobby)
+
+Railway sperrt ausgehendes SMTP (Ports 25/465/587/2525) im Hobby-Tarif. Der Bot versendet deshalb über die
+HTTPS-API von [Brevo](https://www.brevo.com) (EU-Anbieter, Gratis-Tarif für kleine Mengen):
+
+1. Kostenloses Brevo-Konto anlegen.
+2. **Senders, Domains & Dedicated IPs → Senders → Add a sender**: Absenderadresse eintragen (eine Firmenadresse,
+   keine gmx-/gmail-Adresse – deren DMARC-Richtlinie verhindert den Versand über Brevo) und den Link in der
+   Bestätigungsmail anklicken.
+3. **SMTP & API → API Keys → Generate a new API key**.
+4. **Security → Authorised IPs**: die Sperre für unbekannte IP-Adressen **deaktivieren** – Railway hat keine feste
+   IP, sonst blockiert Brevo den Bot nach einem Neustart (Fehler „unrecognised IP address“).
+5. In Railway setzen: `ZEITFLOW_BREVO_API_KEY` (Schlüssel) und `ZEITFLOW_MAIL_FROM` (bestätigte Adresse).
+   Mehrere Empfänger in `ZEITFLOW_REPORT_EMAIL` mit Komma trennen.
+6. Im Bot `/testmail adresse` senden. Fehlermeldungen von Brevo werden im Klartext angezeigt.
+
+**Absender auf einer Domain mit strenger DMARC-Richtlinie** (z. B. `p=reject` bei solarvan.net oder
+`p=quarantine` bei gmx.net): Brevo lehnt den Versand ab („DMARC policy requires domain authentication“), bis die
+Domain bei Brevo authentifiziert ist. Bei einer eigenen Domain geht das so: **Senders, Domains & Dedicated IPs →
+Domains → Add a domain**, dann die angezeigten DNS-Einträge (Brevo-Code und DKIM) beim Domain-Anbieter eintragen
+(Strato: Domains → Domainverwaltung → DNS → TXT-/CNAME-Records) und in Brevo auf „Authenticate“ klicken. Das
+verbessert auch die Zustellbarkeit bei Domains ohne DMARC (Outlook/Microsoft sortiert sonst eher als Spam aus).
+
 ## Deployment (Railway)
 
 1. Repository in Railway verbinden (**New Project → Deploy from GitHub Repo**), Build per `Dockerfile`.
