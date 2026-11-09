@@ -26,6 +26,16 @@ class SmtpSettings:
 
 
 @dataclass(frozen=True)
+class MailSettings:
+    """Versandweg: "smtp" (eigener Mailserver) oder "brevo" (HTTPS-API, nötig wo Hoster SMTP sperren)."""
+
+    provider: str
+    brevo_api_key: str
+    sender: str
+    sender_name: str
+
+
+@dataclass(frozen=True)
 class Settings:
     bot_token: str
     db_path: Path
@@ -35,6 +45,7 @@ class Settings:
     report_weekday: int  # 0 = Sonntag (python-telegram-bot-Konvention)
     report_time: time
     smtp: SmtpSettings
+    mail: MailSettings
     anthropic_api_key: str
     translation_model: str
     company_name: str = ""
@@ -74,6 +85,12 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if security not in {"starttls", "ssl", "none"}:
         raise ConfigError("ZEITFLOW_SMTP_SECURITY muss starttls, ssl oder none sein")
     default_port = {"starttls": 587, "ssl": 465, "none": 25}[security]
+    brevo_key = env.get("ZEITFLOW_BREVO_API_KEY", "").strip()
+    provider = env.get("ZEITFLOW_MAIL_PROVIDER", "brevo" if brevo_key else "smtp").strip().lower()
+    if provider not in {"smtp", "brevo"}:
+        raise ConfigError("ZEITFLOW_MAIL_PROVIDER muss smtp oder brevo sein")
+    smtp_sender = env.get("ZEITFLOW_SMTP_FROM", env.get("ZEITFLOW_SMTP_USER", ""))
+    company = env.get("ZEITFLOW_COMPANY_NAME", "")
     return Settings(
         bot_token=env.get("ZEITFLOW_BOT_TOKEN", ""),
         db_path=Path(env.get("ZEITFLOW_DB_PATH", "zeitflow.db")),
@@ -90,7 +107,13 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             sender=env.get("ZEITFLOW_SMTP_FROM", env.get("ZEITFLOW_SMTP_USER", "")),
             security=security,
         ),
+        mail=MailSettings(
+            provider=provider,
+            brevo_api_key=brevo_key,
+            sender=env.get("ZEITFLOW_MAIL_FROM", smtp_sender).strip(),
+            sender_name=env.get("ZEITFLOW_MAIL_FROM_NAME", company or "ZeitFlow").strip(),
+        ),
         anthropic_api_key=env.get("ANTHROPIC_API_KEY", ""),
         translation_model=env.get("ZEITFLOW_TRANSLATION_MODEL", "claude-opus-5-5"),
-        company_name=env.get("ZEITFLOW_COMPANY_NAME", ""),
+        company_name=company,
     )
