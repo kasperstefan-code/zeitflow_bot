@@ -95,8 +95,18 @@ HTTPS-API von [Brevo](https://www.brevo.com) (EU-Anbieter, Gratis-Tarif für kle
    keine gmx-/gmail-Adresse – deren DMARC-Richtlinie verhindert den Versand über Brevo) und den Link in der
    Bestätigungsmail anklicken.
 3. **SMTP & API → API Keys → Generate a new API key**.
-4. In Railway setzen: `ZEITFLOW_BREVO_API_KEY` (Schlüssel) und `ZEITFLOW_MAIL_FROM` (bestätigte Adresse).
-5. Im Bot `/testmail adresse` senden. Fehlermeldungen von Brevo werden im Klartext angezeigt.
+4. **Security → Authorised IPs**: die Sperre für unbekannte IP-Adressen **deaktivieren** – Railway hat keine feste
+   IP, sonst blockiert Brevo den Bot nach einem Neustart (Fehler „unrecognised IP address“).
+5. In Railway setzen: `ZEITFLOW_BREVO_API_KEY` (Schlüssel) und `ZEITFLOW_MAIL_FROM` (bestätigte Adresse).
+   Mehrere Empfänger in `ZEITFLOW_REPORT_EMAIL` mit Komma trennen.
+6. Im Bot `/testmail adresse` senden. Fehlermeldungen von Brevo werden im Klartext angezeigt.
+
+**Absender auf einer Domain mit strenger DMARC-Richtlinie** (z. B. `p=reject` bei solarvan.net oder
+`p=quarantine` bei gmx.net): Brevo lehnt den Versand ab („DMARC policy requires domain authentication“), bis die
+Domain bei Brevo authentifiziert ist. Bei einer eigenen Domain geht das so: **Senders, Domains & Dedicated IPs →
+Domains → Add a domain**, dann die angezeigten DNS-Einträge (Brevo-Code und DKIM) beim Domain-Anbieter eintragen
+(Strato: Domains → Domainverwaltung → DNS → TXT-/CNAME-Records) und in Brevo auf „Authenticate“ klicken. Das
+verbessert auch die Zustellbarkeit bei Domains ohne DMARC (Outlook/Microsoft sortiert sonst eher als Spam aus).
 
 ## Deployment (Railway)
 

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import json
+import re
 import smtplib
 import ssl
 import urllib.error
 import urllib.request
 from email.message import EmailMessage
+from email.utils import getaddresses
 from typing import Protocol
 
 from zeitflow.config import MailSettings, Settings, SmtpSettings
@@ -62,10 +65,29 @@ class SmtpMailer:
 
 
 BREVO_URL = "https://api.brevo.com/v3/smtp/email"
-BREVO_HINTS = {
-    401: "API-Schlüssel ungültig (ZEITFLOW_BREVO_API_KEY prüfen)",
-    403: "Zugriff verweigert – IP-Freigabe oder Konto bei Brevo prüfen",
-}
+_SAFE_KEY = re.compile(r"[\x21-\x7e]+")
+
+
+def _recipients(raw: str) -> list[dict]:
+    """ "a@x.de, b@y.de" → mehrere Empfänger (beim SMTP-Versand ging das über den To-Header)."""
+    return [{"email": addr} for _, addr in getaddresses([raw.replace(";", ",")]) if addr]
+
+
+def _brevo_hint(status: int, detail: str, sender: str) -> str:
+    low = detail.lower()
+    if "ip" in low.split() or "ip address" in low or "unrecognised ip" in low or "unrecognized ip" in low:
+        return "Brevo blockiert unbekannte IP – unter Security → Authorised IPs die IP-Sperre deaktivieren"
+    if "dmarc" in low or "domain authentication" in low:
+        return (
+            f"Domain von {sender} bei Brevo authentifizieren (Senders, Domains → Domains) oder anderen Absender wählen"
+        )
+    if "sender" in low:
+        return f"Absender {sender} bei Brevo unter Senders bestätigen"
+    if status == 401:
+        return "API-Schlüssel ungültig (ZEITFLOW_BREVO_API_KEY prüfen)"
+    if status == 403:
+        return "Zugriff verweigert – Konto bzw. IP-Freigabe bei Brevo prüfen"
+    return ""
 
 
 class BrevoMailer:
@@ -79,7 +101,7 @@ class BrevoMailer:
     def build_payload(self, recipient: str, subject: str, body: str, attachments: list[RenderedFile]) -> dict:
         payload = {
             "sender": {"email": self.settings.sender, "name": self.settings.sender_name[:70]},
-            "to": [{"email": recipient}],
+            "to": _recipients(recipient),
             "subject": subject,
             "textContent": body,
         }
@@ -106,22 +128,38 @@ class BrevoMailer:
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
-                body = json.loads(exc.read().decode("utf-8") or "{}")
-                detail = body.get("message") or body.get("code") or ""
-            except (ValueError, OSError):
+                data = json.loads(exc.read().decode("utf-8") or "{}")
+                if isinstance(data, dict):
+                    detail = str(data.get("message") or data.get("code") or "")
+            except Exception:  # noqa: BLE001 – Fehlertext ist nur Zusatzinfo
                 pass
-            hint = BREVO_HINTS.get(exc.code, "")
-            if "sender" in detail.lower() or "DMARC" in detail:
-                hint = f"Absender {self.settings.sender} bei Brevo unter Senders bestätigen"
+            hint = _brevo_hint(exc.code, detail, self.settings.sender)
             parts = [p for p in (f"Brevo HTTP {exc.code}", detail, hint) if p]
             raise MailError("E-Mail-Versand fehlgeschlagen: " + " – ".join(parts)) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise MailError(f"E-Mail-Versand fehlgeschlagen: Brevo nicht erreichbar ({exc})") from exc
+        except http.client.HTTPException as exc:
+            raise MailError(
+                f"E-Mail-Versand fehlgeschlagen: ungültige Antwort von Brevo ({type(exc).__name__})"
+            ) from exc
+        except (UnicodeError, ValueError):
+            # Kein str(exc): urllib zitiert bei ungültigen Headern den kompletten API-Schlüssel.
+            raise MailError(
+                "E-Mail-Versand fehlgeschlagen: ZEITFLOW_BREVO_API_KEY enthält ungültige Zeichen "
+                "(Leerzeichen/Zeilenumbruch beim Kopieren?)"
+            ) from None
 
     async def send(self, recipient: str, subject: str, body: str, attachments: list[RenderedFile]) -> None:
         if not self.settings.brevo_api_key or not self.settings.sender:
             raise MailError("Brevo ist nicht konfiguriert (ZEITFLOW_BREVO_API_KEY / ZEITFLOW_MAIL_FROM)")
+        if not _SAFE_KEY.fullmatch(self.settings.brevo_api_key):
+            raise MailError(
+                "E-Mail-Versand fehlgeschlagen: ZEITFLOW_BREVO_API_KEY enthält ungültige Zeichen "
+                "(Leerzeichen/Zeilenumbruch beim Kopieren?)"
+            )
         payload = self.build_payload(recipient, subject, body, attachments)
+        if not payload["to"]:
+            raise MailError("E-Mail-Versand fehlgeschlagen: keine gültige Empfängeradresse")
         await asyncio.to_thread(self._post, payload)
 
 

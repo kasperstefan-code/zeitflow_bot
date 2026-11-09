@@ -195,3 +195,59 @@ def test_provider_selection():
     assert isinstance(build_mailer(brevo), BrevoMailer)
     fallback = load_settings({"ZEITFLOW_BREVO_API_KEY": "k", "ZEITFLOW_SMTP_FROM": "alt@firma.de"})
     assert fallback.mail.sender == "alt@firma.de"
+
+
+async def test_brevo_key_with_line_break_never_leaks(fake_brevo):
+    server = fake_brevo()
+    mailer = BrevoMailer(brevo_settings(brevo_api_key="xkeysib-SECRET1\nSECRET2"), url=server.url)
+    with pytest.raises(MailError) as exc:
+        await mailer.send("a@b.de", "s", "b", [])
+    assert "SECRET" not in str(exc.value) and "ungültige Zeichen" in str(exc.value)
+    assert server.requests == []
+
+
+@pytest.mark.parametrize(
+    "status,body,expected",
+    [
+        (401, {"code": "unauthorized", "message": "We have detected you are using an unrecognised IP address 1.2.3.4"},
+         "Authorised IPs"),
+        (400, {"code": "invalid_parameter", "message": "DMARC policy requires domain authentication"},
+         "Domain von info@firma.de bei Brevo authentifizieren"),
+        (502, None, "Brevo HTTP 502"),
+        (500, ["kaputt"], "Brevo HTTP 500"),
+        (400, {"code": 42}, "Brevo HTTP 400 – 42"),
+    ],
+)  # fmt: skip
+async def test_brevo_error_hints(fake_brevo, status, body, expected):
+    server = fake_brevo(status=status, body=body if body is not None else "")
+    with pytest.raises(MailError) as exc:
+        await BrevoMailer(brevo_settings(), url=server.url).send("a@b.de", "s", "b", [])
+    assert expected in str(exc.value)
+    if status == 401:
+        assert "API-Schlüssel ungültig" not in str(exc.value)
+
+
+async def test_brevo_multiple_recipients(fake_brevo):
+    server = fake_brevo()
+    await BrevoMailer(brevo_settings(), url=server.url).send("abrechnung@firma.de; chef@firma.de", "s", "b", [])
+    assert server.requests[0]["json"]["to"] == [{"email": "abrechnung@firma.de"}, {"email": "chef@firma.de"}]
+
+
+async def test_brevo_truncated_response_is_mail_error():
+    import socket
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve():
+        conn, _ = listener.accept()
+        conn.recv(65536)
+        conn.sendall(b'HTTP/1.1 201 Created\r\nContent-Length: 100\r\n\r\n{"mess')
+        conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    with pytest.raises(MailError, match="E-Mail-Versand fehlgeschlagen"):  # nie eine rohe http.client-Ausnahme
+        await BrevoMailer(brevo_settings(), url=f"http://127.0.0.1:{port}/v3/smtp/email").send("a@b.de", "s", "b", [])
+    listener.close()
